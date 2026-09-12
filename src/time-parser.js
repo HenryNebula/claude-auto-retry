@@ -5,7 +5,41 @@ const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', '
 const RESET_TIME_REGEX = /resets?\s+(?:on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i;
 const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|h|m)\b/i;
 
+// ISO wall-clock datetime emitted by custom LLM providers — e.g. the format:
+//   "Your limit will reset at 2026-09-13 02:29:27"
+// There is no timezone indicator; the datetime is in the provider's local clock.
+// We parse it naively (treating it as UTC for arithmetic purposes) and return a
+// special `isoWallClockMs` shape so that calculateWaitMs can apply a calibrated
+// UTC offset supplied by the caller (see tz-calibrate.js).
+const ISO_DATETIME_REGEX = /reset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/i;
+
 export function parseResetTime(text) {
+  // Try ISO wall-clock datetime first: "reset at 2026-09-13 02:29:27"
+  // This format is produced by custom/proxy LLM providers that forward Anthropic
+  // rate-limit metadata verbatim but in a non-standard layout.  It must be checked
+  // before the hh:mm regex below, which would otherwise consume just the time part
+  // and discard the date.
+  const isoMatch = text.match(ISO_DATETIME_REGEX);
+  if (isoMatch) {
+    // Normalise the separator so Date.parse works on both "T" and " " variants.
+    const normalised = isoMatch[1].replace(' ', 'T');
+    // Parse as if UTC — we don't know the real timezone yet.  The caller can
+    // supply an offsetMinutes value (from tz-calibrate.calibrateTimezoneFromHistory)
+    // to convert this to a true UTC epoch.
+    const naiveMs = Date.parse(`${normalised}Z`);
+    if (Number.isFinite(naiveMs)) {
+      const durMatch = text.match(/limit reached for\s+(\d+)\s*(?:hour|h|minute|min)/i);
+      const limitHours = durMatch ? parseInt(durMatch[1], 10) : null;
+      return {
+        isoWallClockMs: naiveMs,
+        isoDateTimeStr: isoMatch[1],
+        limitHours,
+        rawText: text,
+        needsTzCalibration: true,
+      };
+    }
+  }
+
   // Try absolute time first: "resets at 3pm (UTC)"
   const absMatch = text.match(RESET_TIME_REGEX);
   if (absMatch) {
@@ -62,12 +96,26 @@ export function parseResetTime(text) {
 // session, then giving up before the real reset); spring-forward over-waited an hour.
 const RESET_GRACE_MS = 60 * 60 * 1000; // 1 hour
 
-export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, now = new Date()) {
+export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, now = new Date(), offsetMinutes = null) {
   if (!parsed) return (fallbackHours * 3600 + marginSeconds) * 1000;
 
   // Handle relative times: "try again in 5 minutes"
   if (parsed.relative) {
     return parsed.waitMs + marginSeconds * 1000;
+  }
+
+  // Handle ISO wall-clock datetime from custom LLM providers.
+  if (parsed.isoWallClockMs !== undefined) {
+    if (offsetMinutes === null && parsed.offsetMinutes !== undefined) {
+      offsetMinutes = parsed.offsetMinutes;
+    }
+    if (offsetMinutes === null) {
+      // No calibration available — fall back to the configured default.
+      return (fallbackHours * 3600 + marginSeconds) * 1000;
+    }
+    const trueResetMs = parsed.isoWallClockMs - offsetMinutes * 60_000;
+    const diff = trueResetMs - now.getTime();
+    return Math.max(0, diff) + marginSeconds * 1000;
   }
 
   let tz;

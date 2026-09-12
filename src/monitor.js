@@ -1,5 +1,6 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, detectStreamInterrupted, streamInterruptedMatch, nearLimitWrapUpMatch, isWorking, isInternalRetry, resumedAfterLimit } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
+import { calibrateTimezoneFromHistory } from './tz-calibrate.js';
 import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
@@ -101,18 +102,30 @@ async function checkForeground(tmuxAdapter, pane, config) {
 // Reads the SAME chrome-aware window the isRateLimited gate reads — an unbounded scan lets
 // reset-shaped text anywhere in the capture outrank the live banner (see the tailLines note
 // on findRateLimitMessage).
-function usageWaitUntil(stripped, config) {
+async function usageWaitUntil(stripped, config) {
   const message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES);
   const parsed = message ? parseResetTime(message) : null;
-  const until = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+  let offsetMinutes = null;
+  if (parsed && parsed.needsTzCalibration) {
+    try {
+      const cal = await calibrateTimezoneFromHistory(parsed);
+      if (cal) {
+        offsetMinutes = cal.offsetMinutes;
+        parsed.offsetMinutes = offsetMinutes;
+        parsed.calibratedTz = cal.timezone;
+      }
+    } catch {}
+  }
+  const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours, new Date(), offsetMinutes);
+  const until = Date.now() + waitMs;
   return { message, parsed, until };
 }
 
 // `fresh` starts a new retry episode: attempts and the give-up flag are cleared. Used by
 // the menu path, where a re-rendered /rate-limit-options menu means the session hit the
 // limit again rather than continuing the old episode.
-function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
-  const { message, parsed, until } = usageWaitUntil(stripped, config);
+async function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
+  const { message, parsed, until } = await usageWaitUntil(stripped, config);
   state.lastRateLimitMessage = message;
   state.waitUntil = until;
   state.status = 'waiting';
@@ -120,7 +133,9 @@ function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
   // fallback stays open to correction (correctUsageWait), so a wait derived from a genuine
   // banner is never re-parsed — no window for stray reset-shaped text to move it, and none
   // of the ~600 dead re-derivations a 5h wait would otherwise run.
-  state._waitIsFallback = !parsed;
+  // For uncalibrated ISO resets, keep _waitIsFallback true so a subsequent tick can calibrate
+  // once the log entry reaches disk.
+  state._waitIsFallback = Boolean(!parsed || (parsed.needsTzCalibration && parsed.offsetMinutes === undefined));
   state._gaveUp = false;
   if (fresh) state.attempts = 0;
   return 'waiting';
@@ -147,13 +162,13 @@ function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
 //   - Success clears the latch: the wait now comes from a real reset time, so it stops
 //     being a candidate and the correction logs exactly once.
 const WAIT_CORRECTION_EPSILON_MS = 1000;
-function correctUsageWait(state, stripped, config) {
+async function correctUsageWait(state, stripped, config) {
   if (!state._waitIsFallback) return null;
   if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) return null;
-  const { message, parsed, until } = usageWaitUntil(stripped, config);
+  const { message, parsed, until } = await usageWaitUntil(stripped, config);
   if (!parsed || until > state.waitUntil - WAIT_CORRECTION_EPSILON_MS) return null;
   state.waitUntil = until;
-  state._waitIsFallback = false;
+  state._waitIsFallback = Boolean(parsed.needsTzCalibration && parsed.offsetMinutes === undefined);
   return message;
 }
 
@@ -225,7 +240,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // new retry episode — carrying the old attempt count over left the correction blocked
     // and, once maxRetries had been reached, published a healthy-looking countdown that
     // gave up again on expiry without ever sending.
-    enterUsageWait(state, stripped, config, { fresh: true });
+    await enterUsageWait(state, stripped, config, { fresh: true });
     state._menuCooldownUntil = Date.now() + cooldown;
     return 'menu-confirmed';
   }
@@ -244,7 +259,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // lastRateLimitMessage is set ONLY on the branch that logs it — a correction that falls
     // through to 'retried'/'user-continued' would otherwise leave the message set for the
     // next plain 'waiting' tick to log as a spurious fresh detection.
-    const correctedMessage = correctUsageWait(state, stripped, config);
+    const correctedMessage = await correctUsageWait(state, stripped, config);
     if (Date.now() < state.waitUntil && !resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES)) {
       if (!correctedMessage) return 'waiting';
       state.lastRateLimitMessage = correctedMessage;
@@ -312,7 +327,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       // Self-recovery: Claude resumed during the backoff → don't interrupt it.
       if (isWorking(stripped)) { resetOverload(state); state.status = 'monitoring'; return 'overload-cleared'; }
       // A usage limit appearing mid-wait still takes precedence.
-      if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) { resetOverload(state); return enterUsageWait(state, stripped, config); }
+      if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) { resetOverload(state); return await enterUsageWait(state, stripped, config); }
 
       const foregroundOk = await checkForeground(tmuxAdapter, pane, config);
       if (!foregroundOk.ok) {
@@ -343,7 +358,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // Usage-limit takes precedence: hand off to the (hours-scale) reset path.
     if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
       resetOverload(state);
-      return enterUsageWait(state, stripped, config);
+      return await enterUsageWait(state, stripped, config);
     }
 
     // Overload text gone → recovered. Back to plain monitoring.
@@ -415,7 +430,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
 
     // A usage limit or Claude resuming takes precedence / means recovery.
     if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
-      resetSafeguard(state); return enterUsageWait(state, stripped, config);
+      resetSafeguard(state); return await enterUsageWait(state, stripped, config);
     }
     // In flight (our retry, or the user typing continued things). Defer WITHOUT consuming
     // or resetting — a tick landing mid-retry must not zero the counter, or a sticky flag
@@ -471,7 +486,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
 
     // A usage limit or Claude resuming takes precedence / means recovery.
     if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
-      resetInterrupted(state); return enterUsageWait(state, stripped, config);
+      resetInterrupted(state); return await enterUsageWait(state, stripped, config);
     }
     // In flight (our resume, or the user typing) — defer WITHOUT consuming or resetting
     // the counter, exactly as the safeguard/overload branches do.
@@ -520,7 +535,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   // background-agent spam; the cost of dropping the gate is only a cosmetic re-detection
   // cycle (detect → wait → user-continued) that never actually injects.
   if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
-    return enterUsageWait(state, stripped, config);
+    return await enterUsageWait(state, stripped, config);
   }
 
   // Recovery closes an event-path overload incident. That path returns to monitoring
