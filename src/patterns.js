@@ -179,6 +179,7 @@ const LIMIT_PATTERNS = [...LIMIT_NAME_PATTERNS, ...RETRY_HINT_PATTERNS];
 // Month names for the date-bearing form below; shared with time-parser.js's clause regex.
 const MONTH = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?';
 const RESET_PATTERNS = [
+  /resets?\s+at\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/i,   // "reset at 2026-09-13 02:29:27" (custom LLM provider ISO format)
   /resets?\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?/i,   // "resets 3pm" / "resets at 3:00 PM"
   // Weekly limits render a CALENDAR DATE: "resets Aug 21 at 3pm (Australia/Brisbane)" (a
   // real record, PR #56's fixture). The clock-only form above needs a digit right after
