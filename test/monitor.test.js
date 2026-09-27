@@ -1,6 +1,9 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMonitorState, processOneTick } from '../src/monitor.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createMonitorState, processOneTick, usageWaitUntil } from '../src/monitor.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 import { calculateWaitMs } from '../src/time-parser.js';
 
@@ -658,5 +661,102 @@ describe('processOneTick', () => {
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
     assert.equal(s.attempts, 0);
     assert.equal(s._gaveUp, false);
+  });
+});
+
+// --- A date-only ISO reset (the day named, the clock lost to a pane wrap or an
+//     abbreviated render) is an INCOMPLETE read: the wait derived from it is a bound,
+//     not the reset instant. The correction latch must stay OPEN so the live banner
+//     keeps being re-read and the wait shortens once a fuller render appears — the
+//     wrapped-banner incident latched it shut and overslept ~2h past the reset. ---
+describe('date-only ISO reset stays correctable', () => {
+  const ROW1 = '● API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27';
+  const ROW2 = '06:03:10][20260927033502f67d4517f84f4b80]';
+
+  // Point calibration at an empty config dir so the tick is deterministic regardless
+  // of the real ~/.claude history on the machine running the suite.
+  let savedConfigDir;
+  before(() => {
+    savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'car-tests-'));
+  });
+  after(() => {
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  });
+
+  it('enters waiting on a date-only banner with the fallback latch OPEN', async () => {
+    const t = mockTmux([ROW1, 'Double press esc to edit your last message'].join('\n'));
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(s._waitIsFallback, true);
+    assert.ok(s.waitUntil > Date.now());
+  });
+  it('feeds the full datetime through when the wrapped clock row is present', async () => {
+    const t = mockTmux([ROW1, ROW2].join('\n'));
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    // The rejoin happened upstream: the message the monitor would log carries the clock.
+    assert.match(s.lastRateLimitMessage, /reset at 2026-09-27 06:03:10/);
+  });
+});
+
+// --- Calibration memoization. The correctable-wait ticks re-derive the wait every
+//     pollIntervalSeconds, and each derivation re-ran calibrateTimezoneFromHistory —
+//     which fully reads every transcript modified in the last 48h (100MB+ on a busy
+//     machine) — for the whole length of the wait. A successful calibration for a
+//     given reset string is immutable, so it is memoized; failures still retry
+//     (the wait-for-flush design depends on it). ---
+describe('tz calibration memoization', () => {
+  const ROW1 = '● API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27';
+  const HINT = 'Double press esc to edit your last message';
+
+  let cfgDir, savedConfigDir;
+  before(() => {
+    savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    cfgDir = mkdtempSync(join(tmpdir(), 'car-tz-memo-'));
+    mkdirSync(join(cfgDir, 'projects', 'p'), { recursive: true });
+    // One history entry carrying the reset string and a provider tag whose digits
+    // encode provider-local time 8h ahead of the entry's UTC timestamp → offset +480.
+    writeFileSync(join(cfgDir, 'projects', 'p', 's.jsonl'), JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-09-26T19:35:03.599Z',
+      message: { content: [{ type: 'text', text: 'API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10][20260927033502aabbccddeeff]' }] },
+    }) + '\n');
+    process.env.CLAUDE_CONFIG_DIR = cfgDir;
+  });
+  after(() => {
+    rmSync(cfgDir, { recursive: true, force: true });
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  });
+
+  it('serves a memoized calibration without touching history again', async () => {
+    const pane = [ROW1, HINT].join('\n');
+    const cache = {};
+    const first = await usageWaitUntil(pane, DEFAULT_CONFIG, cache);
+    assert.equal(first.parsed.offsetMinutes, 480);
+    assert.ok(cache['2026-09-27'], 'memo stored under the reset string');
+
+    // History gone: a memoized derivation still calibrates; a fresh one cannot.
+    rmSync(cfgDir, { recursive: true, force: true });
+    const memoHit = await usageWaitUntil(pane, DEFAULT_CONFIG, cache);
+    assert.equal(memoHit.parsed.offsetMinutes, 480);
+    const fresh = await usageWaitUntil(pane, DEFAULT_CONFIG, {});
+    assert.equal(fresh.parsed.offsetMinutes, undefined);
+  });
+
+  it('the monitor passes its state cache through the wait ticks', async () => {
+    // Re-create the fixture the first test deleted.
+    mkdirSync(join(cfgDir, 'projects', 'p'), { recursive: true });
+    writeFileSync(join(cfgDir, 'projects', 'p', 's.jsonl'), JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-09-26T19:35:03.599Z',
+      message: { content: [{ type: 'text', text: '[Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10][20260927033502aabbccddeeff]' }] },
+    }) + '\n');
+    const t = mockTmux([ROW1, HINT].join('\n'));
+    const s = createMonitorState();
+    await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+    assert.ok(s._tzCache['2026-09-27'], 'state cache populated on first detection');
   });
 });

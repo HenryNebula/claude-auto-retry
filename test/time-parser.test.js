@@ -232,3 +232,58 @@ describe('date-bearing resets (weekly limit)', () => {
     assert.equal(wait, (3 * 24 + 9) * 3600_000);                  // Jan 2 2027 09:00Z
   });
 });
+
+// --- Date-only ISO resets: "… will reset at 2026-09-27" — the day named, the clock
+//     lost (a pane wrap between date and time, or an abbreviated render). The year
+//     used to feed the generic hour clause (\d{1,2} read "20" out of "2026"), turning
+//     the banner into a confident "today at 8pm" ~2h past the real reset. ---
+describe('parseResetTime — date-only ISO reset', () => {
+  const DATE_ONLY = 'Usage limit reached for 5 hour. Your limit will reset at 2026-09-27';
+  it('parses as midnight wall-clock marked isoDateOnly, never as an hour', () => {
+    const p = parseResetTime(DATE_ONLY);
+    assert.equal(p.isoDateOnly, true);
+    assert.equal(p.isoWallClockMs, Date.parse('2026-09-27T00:00:00Z'));
+    assert.equal(p.limitHours, 5);
+    assert.equal(p.needsTzCalibration, true);
+  });
+  it('a full ISO datetime is not date-only (the full form is tried first)', () => {
+    const p = parseResetTime('Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10][tag]');
+    assert.equal(p.isoDateOnly, undefined);
+    assert.equal(p.isoDateTimeStr, '2026-09-27 06:03:10');
+  });
+  it('the year is never read as an hour by the generic clause', () => {
+    // "2026" fed \d{1,2} → hour 20 → "today at 8pm". Now: no match → the bounded,
+    // correctable fallback rather than a confident wrong instant.
+    assert.equal(parseResetTime('limit resets 2026-09-27'), null);
+  });
+});
+
+describe('calculateWaitMs — date-only ISO reset', () => {
+  const p = () => parseResetTime('Usage limit reached for 5 hour. Your limit will reset at 2026-09-27');
+  const MARGIN = 60;
+  it('named midnight already past in the calibrated clock → bounded by the limit window', () => {
+    // The incident: detected 19:35Z, calibrated +8 puts the named midnight at 16:00Z —
+    // past. The true reset sat 2h28m out but no clock was visible, so the 5h window
+    // bounds the wait (and the monitor keeps re-reading the live banner).
+    const now = new Date('2026-09-26T19:35:07Z');
+    assert.equal(calculateWaitMs(p(), MARGIN, 5, now, 480), (5 * 3600 + MARGIN) * 1000);
+  });
+  it('named midnight future but past the window bound → the bound wins', () => {
+    const now = new Date('2026-09-26T10:00:00Z');   // earliest possible = 16:00Z, 6h out
+    assert.equal(calculateWaitMs(p(), MARGIN, 5, now, 480), (5 * 3600 + MARGIN) * 1000);
+  });
+  it('named midnight future within the window bound → earliest possible instant', () => {
+    const now = new Date('2026-09-26T14:00:00Z');   // earliest possible = 16:00Z, 2h out
+    assert.equal(calculateWaitMs(p(), MARGIN, 5, now, 480), (2 * 3600 + MARGIN) * 1000);
+  });
+  it('no calibration → configured fallback, as for any ISO reset', () => {
+    const now = new Date('2026-09-26T19:35:07Z');
+    assert.equal(calculateWaitMs(p(), MARGIN, 9, now, null), (9 * 3600 + MARGIN) * 1000);
+  });
+});
+
+describe('parseResetTime — truncated spinner text is not a date-only reset', () => {
+  it('rejects a date followed by an ellipsis (internal-retry spinner truncation)', () => {
+    assert.equal(parseResetTime('Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 … · Retrying in 4s'), null);
+  });
+});

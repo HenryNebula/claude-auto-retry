@@ -178,9 +178,27 @@ const LIMIT_PATTERNS = [...LIMIT_NAME_PATTERNS, ...RETRY_HINT_PATTERNS];
 
 // Month names for the date-bearing form below; shared with time-parser.js's clause regex.
 const MONTH = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?';
+// Claude Code's own internal-retry spinner — "✻ 429 <truncated error> · Retrying in 4s ·
+// attempt 4/10" — is a LIVE turn still failing and retrying on its own, never a terminal
+// banner. At some pane widths its truncation exposes limit vocabulary AND reset-shaped
+// text (observed live in the E2E harness: "… Your limit will reset at 2026-09-27 … ·
+// Retrying in 4s · attempt 4/10"), which satisfied both the limit and reset clauses and
+// made the monitor enter an hours-scale wait — then churn it away on the resumed-working
+// check every tick for the whole retry phase. Both signatures TOGETHER identify the
+// spinner; neither alone is safe to veto on (logs quote "attempt 3/10"; hints say
+// "Retrying in"). Invisible to isRateLimited AND findRateLimitMessage alike.
+function isInternalRetryLine(line) {
+  return /Retrying in\b/i.test(line) && /\battempt\s+\d+\s*\/\s*\d+/i.test(line);
+}
+
 const RESET_PATTERNS = [
   /resets?\s+at\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/i,   // "reset at 2026-09-13 02:29:27" (custom LLM provider ISO format)
-  /resets?\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?/i,   // "resets 3pm" / "resets at 3:00 PM"
+  // "reset at 2026-09-27" — date-only: the day named without a clock. The ellipsis
+  // lookahead rejects the TRUNCATED variant: Claude Code's internal-retry spinner
+  // hard-cuts the banner ("… will reset at 2026-09-27 … · Retrying in 4s"), which is a
+  // live turn re-rendering, not a terminal render.
+  /resets?\s+at\s+\d{4}-\d{2}-\d{2}(?![T ]\d)(?!\s*(?:…|\.\.\.))/i,
+  /resets?\s+(?:at\s+)?\d{1,2}(?!\d)(?::\d{2})?\s*(?:am|pm)?/i,   // "resets 3pm" / "resets at 3:00 PM"; (?!\d): a year is not an hour
   // Weekly limits render a CALENDAR DATE: "resets Aug 21 at 3pm (Australia/Brisbane)" (a
   // real record, PR #56's fixture). The clock-only form above needs a digit right after
   // "resets", so this render was neither detected nor parsed. The clause ends at the time,
@@ -402,6 +420,13 @@ function hasNearbyMatch(lines, idx, patterns, mask = null) {
   return false;
 }
 
+// OR two per-line masks (either may be null) — e.g. tool-echo + internal-retry spinners.
+function combineMask(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return a.map((v, i) => v || b[i]);
+}
+
 // --- Tool-call echo (#63) ---
 // Error/limit text inside a tool-call render — a grep argument, a quoted log line in the
 // result block — is text ABOUT an error, never the live state, yet it sits in the most
@@ -503,11 +528,14 @@ export function isRateLimited(text, customPatterns = [], tailLines = 0) {
   }
 
   // Find a "limit" line with a "resets" line nearby (works for both
-  // single-line messages and multi-line TUI renders)
+  // single-line messages and multi-line TUI renders). Internal-retry spinners are
+  // invisible here as both the limit and the reset anchor — a live turn is not a
+  // terminal banner however much banner text its truncation exposes.
+  const spinner = lines.map(isInternalRetryLine);
   for (let i = 0; i < lines.length; i++) {
-    if (mask && mask[i]) continue;
+    if (spinner[i] || (mask && mask[i])) continue;
     if (LIMIT_PATTERNS.some(p => p.test(lines[i]))) {
-      if (hasNearbyMatch(lines, i, RESET_PATTERNS, mask)) return true;
+      if (hasNearbyMatch(lines, i, RESET_PATTERNS, combineMask(mask, spinner))) return true;
     }
   }
 
@@ -824,6 +852,18 @@ export function isInternalRetry(text) {
 // monitor then wakes into the still-live limit and burns its retries before the real
 // reset. Callers that gate on isRateLimited must pass the same window it read. 0 keeps the
 // full scan for print mode, where the input is process output rather than a scrolling TUI.
+// A long ISO banner WRAPS in a narrow pane, and the TUI breaks lines at spaces — which
+// is exactly the gap between the date and the clock: "… will reset at 2026-09-27" on
+// one row, "06:03:10][…]" on the next. capture-pane runs without -J (src/tmux.js), so
+// the wrap arrives as separate physical lines and the row the scan selects carries only
+// the date — leaving parseResetTime no clock to read (its date-only branch, and the
+// year-misread-as-hour bug it now guards). Rejoin ONLY that shape — a line ending in a
+// bare ISO date whose immediately following row leads with hh:mm:ss — so an unrelated
+// hint line ("Double press esc to edit your last message") can never be glued onto a
+// banner. Anything else keeps the single-line return.
+const ISO_DATE_EOL = /\d{4}-\d{2}-\d{2}\s*$/;
+const TIME_BOL = /^\s*\d{2}:\d{2}:\d{2}\b/;
+
 export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
   const all = stripAnsi(text).split('\n');
   // Tool-echo mask (#63): without it, a quoted "resets 9am" in a fresh grep line below a
@@ -837,7 +877,9 @@ export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
     : { start: 0, end: all.length };
   const lines = all.slice(start, end);
   const fullMask = toolEchoMask(all).slice(start, end);
-  const skip = (i) => fullMask[i] || isChromeLine(lines[i]);
+  // Internal-retry spinners are skipped like tool echo: a live turn's truncation is not
+  // a banner, and the bottom-up scan must fall through it to the real render above.
+  const skip = (i) => fullMask[i] || isChromeLine(lines[i]) || isInternalRetryLine(lines[i]);
   const isReset = (i) => RESET_PATTERNS.some(p => p.test(lines[i]));
   const presentsReset = (i) => presentsResetTime(lines[i]);
 
@@ -861,7 +903,16 @@ export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
   // I know" is what inverts freshness, one unrecognised render at a time.
   for (let i = lines.length - 1; i >= 0; i--) {
     if (skip(i)) continue;
-    if (presentsReset(i)) return lines[i].trim();
+    // Rejoin the wrapped-ISO shape before returning (see ISO_DATE_EOL): the clock the
+    // parser needs may sit on the very next physical row.
+    if (presentsReset(i)) {
+      const first = lines[i].trim();
+      if (ISO_DATE_EOL.test(lines[i]) && i + 1 < lines.length && !skip(i + 1)
+          && TIME_BOL.test(lines[i + 1])) {
+        return `${first} ${lines[i + 1].trim()}`;
+      }
+      return first;
+    }
   }
 
   // Every reset-shaped line on screen was vetoed. Everything below is the pre-#73 behavior

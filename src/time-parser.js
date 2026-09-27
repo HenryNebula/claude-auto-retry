@@ -2,7 +2,10 @@
 // (Australia/Brisbane)". Month names are matched by their first three letters so both
 // "Aug" and "August" resolve; the day may carry an ordinal suffix or a trailing comma.
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-const RESET_TIME_REGEX = /resets?\s+(?:on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i;
+// The hour carries (?!\d): a 4-digit year must never be read as an hour. "reset at
+// 2026-09-27" used to match this clause with hour=20 (the greedy \d{1,2} prefix of
+// "2026"), silently turning a wrapped banner into "today at 8pm" — see ISO_DATE_ONLY_REGEX.
+const RESET_TIME_REGEX = /resets?\s+(?:on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(?:at\s+)?(\d{1,2})(?!\d)(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i;
 const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|h|m)\b/i;
 
 // ISO wall-clock datetime emitted by custom LLM providers — e.g. the format:
@@ -12,6 +15,12 @@ const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(
 // special `isoWallClockMs` shape so that calculateWaitMs can apply a calibrated
 // UTC offset supplied by the caller (see tz-calibrate.js).
 const ISO_DATETIME_REGEX = /reset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/i;
+// The same render with the clock missing: "… will reset at 2026-09-27". Two sources:
+// a provider that names only the day, and — the observed incident — a pane too narrow
+// for the whole banner, where the TUI wraps the line exactly at the space between the
+// date and the time and the capture sees only the first physical row. The lookahead
+// keeps this from stealing a line that carries the full datetime (checked first above).
+const ISO_DATE_ONLY_REGEX = /reset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2})(?![T ]\d{2}:\d{2})(?!\s*(?:…|\.\.\.))/i;
 
 export function parseResetTime(text) {
   // Try ISO wall-clock datetime first: "reset at 2026-09-13 02:29:27"
@@ -33,6 +42,29 @@ export function parseResetTime(text) {
       return {
         isoWallClockMs: naiveMs,
         isoDateTimeStr: isoMatch[1],
+        limitHours,
+        rawText: text,
+        needsTzCalibration: true,
+      };
+    }
+  }
+
+  // Date-only ISO reset: "reset at 2026-09-27". Midnight of the named day, in the
+  // provider's wall clock, marked `isoDateOnly` so calculateWaitMs can treat it as
+  // "sometime during that day" rather than a precise instant. MUST be tried before
+  // the generic hh:mm clause below: that clause's \d{1,2} reads the "20" out of
+  // "2026" and produced "today at 8pm" — a confident, uncorrectable wait ~2h past
+  // the real reset on a wrapped banner (the incident this shape pins).
+  const dateOnlyMatch = text.match(ISO_DATE_ONLY_REGEX);
+  if (dateOnlyMatch) {
+    const naiveMs = Date.parse(`${dateOnlyMatch[1]}T00:00:00Z`);
+    if (Number.isFinite(naiveMs)) {
+      const durMatch = text.match(/limit reached for\s+(\d+)\s*(?:hour|h|minute|min)/i);
+      const limitHours = durMatch ? parseInt(durMatch[1], 10) : null;
+      return {
+        isoWallClockMs: naiveMs,
+        isoDateTimeStr: dateOnlyMatch[1],
+        isoDateOnly: true,
         limitHours,
         rawText: text,
         needsTzCalibration: true,
@@ -114,7 +146,19 @@ export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, n
       return (fallbackHours * 3600 + marginSeconds) * 1000;
     }
     const trueResetMs = parsed.isoWallClockMs - offsetMinutes * 60_000;
-    const diff = trueResetMs - now.getTime();
+    let diff = trueResetMs - now.getTime();
+    if (parsed.isoDateOnly) {
+      // A date-only reset names the DAY the window clears, not the moment. Midnight in
+      // the provider's clock is the EARLIEST possible instant; the banner's own limit
+      // duration ("reached for 5 hour") bounds it from above — a rolling window that
+      // just tripped clears within that many hours of now. Never wait past that bound:
+      // waking inside a still-live day is a cheap, correctable re-read, while the old
+      // behavior (the year mis-read as an hour) parked the session past the real reset
+      // with the correction latch closed. limitHours is null when the banner names no
+      // duration (e.g. a weekly limit) — then the configured default bounds it.
+      const capMs = (parsed.limitHours ?? fallbackHours) * 3600_000;
+      diff = diff > 0 ? Math.min(diff, capMs) : capMs;
+    }
     return Math.max(0, diff) + marginSeconds * 1000;
   }
 

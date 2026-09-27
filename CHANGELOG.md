@@ -7,7 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A date-only reset scrape is completed from the session transcripts.** Custom-provider
+  429s are persisted by Claude Code to the session JSONL as assistant entries flagged
+  `isApiErrorMessage: true`, carrying the banner verbatim — so when the screen yields only
+  "… will reset at 2026-09-27" (the wrapped-banner shape), the missing clock is read back
+  from disk: the recently-modified transcripts are tail-read (last 64KB — a live banner is
+  the last thing a stuck session writes), and the most recent API-error entry whose reset
+  datetime starts with the scraped day completes the parse. The screen stays the primary
+  source — stock subscription banners never reach the JSONL (a rejected turn writes no
+  assistant entry), and entries are gated strictly on the error flag plus a 15-minute
+  recency window, so banners merely quoted in conversation (this tool's own test fixtures
+  being the canonical example) cannot complete a wait. Verified against the live incident:
+  date-only scrape → completion to `06:03:10` → +8h calibration → wake at the true reset
+  +60s margin, with no reliance on the pane rejoin.
+
 ### Fixed
+- **Claude Code's internal-retry spinner can no longer be mistaken for a limit banner.**
+  While Claude Code retries a 429 on its own ("✻ 429 … · Retrying in 4s · attempt 4/10"),
+  the spinner hard-truncates the error text, and at some pane widths the truncation
+  exposes both limit vocabulary and reset-shaped text ("… Your limit will reset at
+  2026-09-27 …") — enough to satisfy the limit+reset pairing and drive an hours-scale
+  wait that then churned away on the resumed-working check every tick for the whole
+  retry phase. A line carrying BOTH spinner signatures ("Retrying in" and "attempt N/M")
+  is now invisible to limit detection and to the banner scan, exactly like tool echo;
+  the date-only reset clause also rejects a trailing ellipsis so a truncated render can
+  never read as "the day without the clock". Found by the new Docker E2E harness
+  (a real Claude Code TUI against a mock API) on its first wrapped-banner run.
+- **A successful tz calibration is memoized per reset string.** While a wait is
+  correctable (an uncalibrated ISO reset, or the date-only shape above), every poll tick
+  re-derived the wait — and each derivation re-ran the history calibration, which fully
+  reads every transcript modified in the last 48h. On a busy machine that is 100MB+ of
+  file reads every `pollIntervalSeconds` for the entire multi-hour wait. The offset for a
+  given reset wall-clock string cannot change within a monitor's lifetime, so it is
+  computed once and served from a state-level memo; failed calibrations are deliberately
+  not memoized, preserving the retry-until-the-transcript-flushes behavior.
+- **A wrapped ISO reset banner no longer parks the session ~2h past the real reset.**
+- **A wrapped ISO reset banner no longer parks the session ~2h past the real reset.**
+  Custom-provider 429s render one long line — "● API Error: Request rejected (429) ·
+  [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10][…]" —
+  and in a pane narrower than that line the TUI wraps it at a space, exactly the one
+  between the date and the clock. capture-pane runs without `-J`, so the wrap arrives as
+  two physical rows and the extractor returned only the first: a date with no time. The
+  generic hour clause then read the "20" out of "2026" (`\d{1,2}` on the year) as 8pm
+  host-local — a confident, non-correctable wait (observed live: limit reset 18:03, monitor
+  slept until 20:00, session resumed by hand at 18:04). Three layers now hold: the
+  extractor rejoins a row ending in a bare ISO date with a following row that leads with
+  `hh:mm:ss` (nothing else is ever glued on); a date-only ISO reset parses as
+  midnight-of-that-day wall clock marked `isoDateOnly`, and the year can no longer feed
+  the hour clause; and a date-only wait is bounded by the banner's own limit window
+  ("reached for 5 hour" ⇒ ≤5h) while staying correctable, so the live banner keeps being
+  re-read and the wait shortens the moment a fuller render appears.
+- **A weekly-limit banner with a calendar date is now detected and parsed.** Weekly limits
 - **A weekly-limit banner with a calendar date is now detected and parsed.** Weekly limits
   render their reset with a date — "You've hit your weekly limit · resets Aug 21 at 3pm
   (Australia/Brisbane)", a real Claude Code record surfaced by PR #56's fixture — and both

@@ -1,5 +1,6 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, detectStreamInterrupted, streamInterruptedMatch, nearLimitWrapUpMatch, isWorking, isInternalRetry, resumedAfterLimit } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
+import { completeDateOnlyReset } from './session-jsonl.js';
 import { calibrateTimezoneFromHistory } from './tz-calibrate.js';
 import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
@@ -38,6 +39,14 @@ export function createMonitorState() {
     // Near-limit wrap-up nudge (#78): a hold after each send so the pane can re-render the
     // nudge as a user row (the dedup), and a count of sends against the SAME notice.
     _wrapUpHoldUntil: 0, _wrapUpNudges: 0,
+    // Memo of SUCCESSFUL tz calibrations, keyed by the reset's wall-clock string. The
+    // correctable-wait ticks re-derive the wait every pollIntervalSeconds, and each
+    // derivation would otherwise re-run calibrateTimezoneFromHistory — which fully reads
+    // every transcript modified in the last 48h (100MB+ on a busy machine) — for the
+    // whole length of the wait. The offset for a given reset string cannot change within
+    // an episode, so one scan is enough. Failures are deliberately NOT memoized: the
+    // retry-until-the-entry-flushes behavior depends on them being retried.
+    _tzCache: {},
   };
 }
 
@@ -102,19 +111,43 @@ async function checkForeground(tmuxAdapter, pane, config) {
 // Reads the SAME chrome-aware window the isRateLimited gate reads — an unbounded scan lets
 // reset-shaped text anywhere in the capture outrank the live banner (see the tailLines note
 // on findRateLimitMessage).
-async function usageWaitUntil(stripped, config) {
-  const message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES);
-  const parsed = message ? parseResetTime(message) : null;
+export async function usageWaitUntil(stripped, config, tzCache = null) {
+  let message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES);
+  let parsed = message ? parseResetTime(message) : null;
+  // Date-only scrape (wrapped/abbreviated banner): the clock exists in the session's
+  // JSONL as an isApiErrorMessage entry — complete the read from there before computing
+  // the wait. On success this lands on the exact reset (still tz-calibrated below), and
+  // the correction latch closes via the normal path since the parse is no longer
+  // date-only. On failure (not flushed yet / never persists) the capped, correctable
+  // date-only wait stands, and the retry-on-every-tick below re-attempts the completion.
+  if (parsed && parsed.isoDateOnly) {
+    const completed = await completeDateOnlyReset(parsed).catch(() => null);
+    if (completed) {
+      message = `${message} [clock completed from session history: ${completed.isoDateTimeStr}]`;
+      parsed = completed;
+    }
+  }
   let offsetMinutes = null;
   if (parsed && parsed.needsTzCalibration) {
-    try {
-      const cal = await calibrateTimezoneFromHistory(parsed);
-      if (cal) {
-        offsetMinutes = cal.offsetMinutes;
-        parsed.offsetMinutes = offsetMinutes;
-        parsed.calibratedTz = cal.timezone;
-      }
-    } catch {}
+    // A successful calibration for this exact reset string is immutable for the life of
+    // the monitor — serve it from the memo instead of re-scanning the transcript store
+    // on every correctable tick (see _tzCache). Nulls retry, by design.
+    const memo = tzCache ? tzCache[parsed.isoDateTimeStr] : undefined;
+    if (memo) {
+      offsetMinutes = memo.offsetMinutes;
+      parsed.offsetMinutes = offsetMinutes;
+      parsed.calibratedTz = memo.timezone;
+    } else {
+      try {
+        const cal = await calibrateTimezoneFromHistory(parsed);
+        if (cal) {
+          offsetMinutes = cal.offsetMinutes;
+          parsed.offsetMinutes = offsetMinutes;
+          parsed.calibratedTz = cal.timezone;
+          if (tzCache) tzCache[parsed.isoDateTimeStr] = cal;
+        }
+      } catch {}
+    }
   }
   const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours, new Date(), offsetMinutes);
   const until = Date.now() + waitMs;
@@ -125,7 +158,7 @@ async function usageWaitUntil(stripped, config) {
 // the menu path, where a re-rendered /rate-limit-options menu means the session hit the
 // limit again rather than continuing the old episode.
 async function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
-  const { message, parsed, until } = await usageWaitUntil(stripped, config);
+  const { message, parsed, until } = await usageWaitUntil(stripped, config, state._tzCache);
   state.lastRateLimitMessage = message;
   state.waitUntil = until;
   state.status = 'waiting';
@@ -134,8 +167,11 @@ async function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
   // banner is never re-parsed — no window for stray reset-shaped text to move it, and none
   // of the ~600 dead re-derivations a 5h wait would otherwise run.
   // For uncalibrated ISO resets, keep _waitIsFallback true so a subsequent tick can calibrate
-  // once the log entry reaches disk.
-  state._waitIsFallback = Boolean(!parsed || (parsed.needsTzCalibration && parsed.offsetMinutes === undefined));
+  // once the log entry reaches disk. A date-only ISO reset (isoDateOnly — the day named, the
+  // clock lost to a pane wrap or an abbreviated render) is likewise an INCOMPLETE read: the
+  // wait is a bound, not the reset instant, so the live banner must keep being re-read.
+  state._waitIsFallback = Boolean(!parsed || parsed.isoDateOnly
+    || (parsed.needsTzCalibration && parsed.offsetMinutes === undefined));
   state._gaveUp = false;
   if (fresh) state.attempts = 0;
   return 'waiting';
@@ -165,10 +201,11 @@ const WAIT_CORRECTION_EPSILON_MS = 1000;
 async function correctUsageWait(state, stripped, config) {
   if (!state._waitIsFallback) return null;
   if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) return null;
-  const { message, parsed, until } = await usageWaitUntil(stripped, config);
+  const { message, parsed, until } = await usageWaitUntil(stripped, config, state._tzCache);
   if (!parsed || until > state.waitUntil - WAIT_CORRECTION_EPSILON_MS) return null;
   state.waitUntil = until;
-  state._waitIsFallback = Boolean(parsed.needsTzCalibration && parsed.offsetMinutes === undefined);
+  state._waitIsFallback = Boolean(parsed.isoDateOnly
+    || (parsed.needsTzCalibration && parsed.offsetMinutes === undefined));
   return message;
 }
 

@@ -1059,3 +1059,62 @@ describe('weekly limit with a calendar-dated reset', () => {
     assert.equal(findRateLimitMessage(pane, [], 12), WEEKLY);
   });
 });
+
+// --- A long ISO banner WRAPS in a narrow pane, and the TUI breaks lines at spaces —
+//     exactly the gap between the date and the clock. capture-pane runs without -J, so
+//     the wrap arrives as two physical rows and the row the bottom-up scan selected
+//     carried only the date. The parser then had no clock to read and mis-took the
+//     "20" of "2026" for 8pm, parking the session ~2h past the real reset (observed
+//     live 2026-09-26: reset 18:03 local, monitor slept until 20:00). ---
+describe('wrapped ISO reset banner', () => {
+  const ROW1 = '● API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27';
+  const ROW2 = '06:03:10][20260927033502f67d4517f84f4b80]';
+
+  it('rejoins the wrapped clock onto the banner row', () => {
+    assert.equal(findRateLimitMessage([ROW1, ROW2].join('\n'), [], 12), `${ROW1} ${ROW2}`);
+  });
+  it('rejoins an indented continuation row too (the TUI may hang the wrap)', () => {
+    assert.equal(findRateLimitMessage([ROW1, `  ${ROW2}`].join('\n'), [], 12), `${ROW1} ${ROW2}`);
+  });
+  it('isRateLimited still detects the banner from the date-only row', () => {
+    assert.equal(isRateLimited([ROW1, ROW2, '', '❯ '].join('\n'), [], 12), true);
+  });
+  it('does not glue a non-clock row onto the banner', () => {
+    const hint = 'Double press esc to edit your last message, or try a different model with /model';
+    assert.equal(findRateLimitMessage([ROW1, hint].join('\n'), [], 12), ROW1);
+  });
+  it('does not glue an echoed (⎿) clock row onto the banner', () => {
+    assert.equal(findRateLimitMessage([ROW1, `  ⎿ ${ROW2}`].join('\n'), [], 12), ROW1);
+  });
+});
+
+// --- The internal-retry spinner ("✻ 429 <truncated error> · Retrying in 4s · attempt
+//     4/10") is a LIVE turn, not a terminal banner — but at some pane widths its
+//     truncation exposes both limit vocabulary and reset-shaped text (observed in the
+//     E2E harness: "… Your limit will reset at 2026-09-27 … · Retrying in 4s · attempt
+//     4/10"), which drove an hours-scale wait churned away every tick. ---
+describe('internal-retry spinner is invisible to limit detection', () => {
+  const SPINNER_DATE_ONLY = '✻ 429 [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 … · Retrying in 4s · attempt 4/10';
+  const SPINNER_FULL_ISO = '✻ 429 [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10 · Retrying in 4s · attempt 4/10';
+
+  it('isRateLimited does not fire on a spinner carrying date-only text', () => {
+    assert.equal(isRateLimited([SPINNER_DATE_ONLY, '', '❯ '].join('\n'), [], 12), false);
+  });
+  it('isRateLimited does not fire on a spinner carrying a full ISO datetime either', () => {
+    // Even a complete reset time on the spinner is not a terminal state — Claude Code
+    // is still retrying on its own; the monitor must not sleep through a recovery.
+    assert.equal(isRateLimited([SPINNER_FULL_ISO, '', '❯ '].join('\n'), [], 12), false);
+  });
+  it('findRateLimitMessage falls through a spinner to the terminal banner above it', () => {
+    const banner = '● API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27';
+    assert.equal(findRateLimitMessage([banner, '06:03:10][20260927033502aabbccddeeff]', SPINNER_DATE_ONLY, '', '❯ '].join('\n'), [], 12) === null, false);
+  });
+  it('a spinner alone yields no message at all', () => {
+    assert.equal(findRateLimitMessage([SPINNER_DATE_ONLY, '', '❯ '].join('\n'), [], 12), null);
+  });
+  it('neither signature alone is vetoed — prose quoting one still detects alongside a banner', () => {
+    // "attempt 3/10" in a quoted log above a real banner must not blind the pairing.
+    const pane = ['log line: attempt 3/10 failed', "You've hit your session limit · resets 3pm (UTC)", '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12), true);
+  });
+});
