@@ -953,6 +953,7 @@ export async function startMonitor(pane, pid) {
         const names = changedSrcNames(srcBaseline, srcNow).join(', ');
         if (await canImportFresh(process.execPath, process.argv[1])) {
           await logger.info(`Source changed (${names}) — restarting monitor into the new code; a pending wait carries over via the status file.`);
+          releaseBgDuty();   // successor re-steals it on its first duty tick; don't leave it stale
           restartSelf();
         } else {
           await logger.warn(`Source changed (${names}) but the new code failed to load — keeping the running version. Will retry the swap on the next change.`);

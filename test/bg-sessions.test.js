@@ -11,7 +11,7 @@ import {
 } from '../src/bg-sessions.js';
 import {
   createBgWatchState, bgWatchTick, saveBgWatchState, loadBgWatchState,
-  acquireBgWatchLock, releaseBgWatchLock, bgWatchDuty, BG_LOCK_STALE_MS,
+  acquireBgWatchLock, releaseBgWatchLock, bgWatchDuty, BG_LOCK_STALE_MS, BG_SETTLE_MS,
 } from '../src/bg-watch.js';
 import { loadConfig } from '../src/config.js';
 
@@ -214,14 +214,105 @@ describe('bgWatchTick', () => {
     const st = state.sessions.get('abcd1234-0000-0000-0000-000000000000');
     let last;
     for (let i = 1; i <= config.maxRetries; i++) {
-      now = st.waitUntil + 1000;
+      now = st.waitUntil + BG_SETTLE_MS + 1000;   // past cooldown AND the settle window
       last = await tick();
       assert.equal(last, 'retried');
       assert.equal(st.attempts, i);
     }
-    now = st.waitUntil + 1000;
+    now = st.waitUntil + BG_SETTLE_MS + 1000;
     assert.equal(await tick(), 'max-retries');
     assert.equal(st.gaveUp, true);
+  });
+
+  // The live incident 2026-09-27: after a send, the daemon keeps the session
+  // state:"blocked" with an EMPTY needs while the retry turn runs — the watcher
+  // read that as "still limited" and stacked three retry turns at cooldown pace.
+  it('stands down after a send while the retry turn is still in flight', async () => {
+    const state = createBgWatchState();
+    state._tzCache[RESET_WALL] = { offsetMinutes: OFFSET_MIN, timezone: 'Asia/Shanghai' };
+    let jobs = mkJobs([{ short: 'abcd1234', state: 'blocked' }]);
+    const sent = [];
+    let now = detectedAt;
+    const tick = () => bgWatchTick(state, {
+      config, lister: async () => jobs, replier: async (s, t) => sent.push([s, t]), logger: quietLogger(), now: () => now,
+    });
+    await tick();
+    const st = state.sessions.get('abcd1234-0000-0000-0000-000000000000');
+    now = st.waitUntil + 1000;          // wake: send attempt 1
+    assert.equal(await tick(), 'retried');
+    assert.equal(sent.length, 1);
+    // Turn in flight: blocked with needs cleared — many ticks, well past the old
+    // cooldown, but inside the settle window. NOTHING may fire, and the session
+    // stays latched in 'waiting' (we sent; the agent has not come back).
+    jobs = mkJobs([{ short: 'abcd1234', state: 'blocked', needs: '' }]);
+    for (let t = 0; t < 5; t++) {
+      now += 60_000;
+      await tick();
+    }
+    assert.equal(sent.length, 1);                    // no further sends
+    assert.equal(st.attempts, 1);                    // budget untouched
+    assert.equal(st.status, 'waiting');              // latched until comeback/settle
+    // Settle window passes with the block still up but no limit banner: stand down
+    // to monitoring — nothing more to do until a limit re-arms it.
+    now += BG_SETTLE_MS;
+    await tick();
+    assert.equal(sent.length, 1);
+    assert.equal(st.status, 'monitoring');
+  });
+
+  it('allows another attempt only after the settle window with the limit still up', async () => {
+    const state = createBgWatchState();
+    state._tzCache[RESET_WALL] = { offsetMinutes: OFFSET_MIN, timezone: 'Asia/Shanghai' };
+    const jobs = mkJobs([{ short: 'abcd1234', state: 'blocked' }]);   // banner never changes
+    const sent = [];
+    let now = detectedAt;
+    const tick = () => bgWatchTick(state, {
+      config, lister: async () => jobs, replier: async (s, t) => sent.push([s, t]), logger: quietLogger(), now: () => now,
+    });
+    await tick();
+    const st = state.sessions.get('abcd1234-0000-0000-0000-000000000000');
+    now = st.waitUntil + 1000;
+    await tick();                                     // attempt 1
+    now += BG_SETTLE_MS + 60_000;                     // settle window passes, still limited
+    assert.equal(await tick(), 'retried');
+    assert.equal(sent.length, 2);
+    assert.equal(st.attempts, 2);
+  });
+
+  it('never arms a wait for a block that is not a usage limit', async () => {
+    const state = createBgWatchState();
+    const jobs = mkJobs([{ short: 'abcd1234', state: 'blocked', needs: 'waiting on permission' }]);
+    const outcome = await bgWatchTick(state, {
+      config, lister: async () => jobs, replier: async () => { throw new Error('must not send'); },
+      logger: quietLogger(), now: () => detectedAt,
+    });
+    assert.equal(outcome, 'idle');
+    assert.equal(state.sessions.get('abcd1234-0000-0000-0000-000000000000').status, 'monitoring');
+  });
+
+  it('clears the in-flight latch when the agent comes back, and re-arms fresh on a new block', async () => {
+    const state = createBgWatchState();
+    state._tzCache[RESET_WALL] = { offsetMinutes: OFFSET_MIN, timezone: 'Asia/Shanghai' };
+    const LATER = 'rate limited — wait and retry · API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-29 07:00:00][x]';
+    state._tzCache['2026-09-29 07:00:00'] = { offsetMinutes: OFFSET_MIN, timezone: 'Asia/Shanghai' };
+    const sent = [];
+    let jobs = mkJobs([{ short: 'abcd1234', state: 'blocked' }]);
+    let now = detectedAt;
+    const tick = () => bgWatchTick(state, {
+      config, lister: async () => jobs, replier: async (s, t) => sent.push([s, t]), logger: quietLogger(), now: () => now,
+    });
+    await tick();
+    const st = state.sessions.get('abcd1234-0000-0000-0000-000000000000');
+    now = st.waitUntil + 1000;
+    await tick();                                     // attempt 1, latch set
+    assert.equal(st.awaiting, true);
+    jobs = mkJobs([{ short: 'abcd1234', state: 'working', needs: '' }]);   // agent came back
+    await tick();
+    assert.equal(st.awaiting, false);
+    jobs = mkJobs([{ short: 'abcd1234', state: 'blocked', needs: LATER }]); // re-blocked later
+    assert.equal(await tick(), 'waiting');
+    assert.equal(st.attempts, 0);                     // fresh episode
+    assert.equal(st.awaiting, false);
   });
 
   it('resets a session that left the blocked state (resume landed)', async () => {

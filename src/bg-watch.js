@@ -16,6 +16,7 @@
 
 import { listBgSessions, replyToBgSession } from './bg-sessions.js';
 import { usageWaitUntil } from './monitor.js';
+import { isRateLimited } from './patterns.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { open, readFile, writeFile, rename, unlink, mkdir } from 'node:fs/promises';
@@ -28,10 +29,22 @@ const BG_LOCK_FILE = join(homedir(), '.claude-auto-retry', 'bg-watch.lock');
 // A leader heartbeats every tick (bgWatch.tickSeconds, ≥15s); three missed
 // heartbeats plus a dead-PID check make the lock stealable. Exported for tests.
 export const BG_LOCK_STALE_MS = 90_000;
+// After sending a retry, stand down at least this long: the daemon keeps a session
+// flagged state:"blocked" (with an EMPTY needs) while the queued retry turn runs,
+// which read as "still limited" and re-sent on every cooldown — observed live as
+// three stacked "Continue where you left off." turns. The latch clears when the
+// session LEAVES the blocked state (the agent came back), when the banner changes
+// (a new limit episode re-arms from scratch), or when this window passes with the
+// limit genuinely still up — a legitimate, attempts-bounded retry.
+export const BG_SETTLE_MS = 10 * 60_000;
+
+// Matches the pane monitor's tail discipline; `needs` is a single clean line, so
+// the window is nominal — the vocabulary gate is what matters.
+const RATE_LIMIT_TAIL_LINES = 12;
 
 export function createBgWatchState() {
   return {
-    sessions: new Map(),   // sessionId → { status, waitUntil, attempts, short, lastNeeds, gaveUp }
+    sessions: new Map(),   // sessionId → { status, waitUntil, attempts, short, lastNeeds, gaveUp, awaiting, awaitingUntil }
     // Memo of successful tz calibrations, shared across sessions (the offset for a
     // given reset wall-clock string cannot change within an episode) — same shape
     // and rationale as the monitor's _tzCache. Deliberately NOT persisted: it is an
@@ -52,6 +65,7 @@ export async function saveBgWatchState(state, file = BG_STATE_FILE) {
     sessions[id] = {
       short: st.short, status: st.status, waitUntil: Math.floor(st.waitUntil),
       attempts: st.attempts, gaveUp: !!st.gaveUp, lastNeeds: st.lastNeeds || '',
+      awaiting: !!st.awaiting, awaitingUntil: Math.floor(st.awaitingUntil || 0),
     };
   }
   await mkdir(BG_STATE_DIR, { recursive: true }).catch(() => {});
@@ -74,6 +88,8 @@ export async function loadBgWatchState(file = BG_STATE_FILE) {
         attempts: Number.isFinite(st.attempts) ? st.attempts : 0,
         gaveUp: !!st.gaveUp,
         lastNeeds: st.lastNeeds || '',
+        awaiting: !!st.awaiting,
+        awaitingUntil: Number.isFinite(st.awaitingUntil) ? st.awaitingUntil : 0,
       });
     }
   }
@@ -176,6 +192,20 @@ export async function bgWatchTick(state, {
     // conversation; replies address the CURRENT worker, so track the latest.
     st.short = job.short;
 
+    // In-flight latch: a retry was sent and the agent has not come back yet. Never
+    // send again while this holds (see BG_SETTLE_MS). A CHANGED banner is the one
+    // escape inside the window: new facts supersede the in-flight retry's episode,
+    // and the re-arm below computes a fresh (longer) wait — no send can escape it.
+    const newBannerWhileAwaiting = st.awaiting && job.needs && st.lastNeeds && job.needs !== st.lastNeeds;
+    if (st.awaiting && job.state === 'blocked' && !newBannerWhileAwaiting && now() < (st.awaitingUntil || 0)) continue;
+    if (st.awaiting) {
+      if (job.state === 'blocked') {
+        await log.info(`Background session ${label(job)}: retry sent ${Math.round(BG_SETTLE_MS / 60000)}min ago and the block never lifted — allowing another attempt.`);
+      }
+      st.awaiting = false;
+      st.awaitingUntil = 0;
+    }
+
     if (job.state !== 'blocked') {
       if (st.status === 'waiting' || st.gaveUp) {
         await log.info(`Background session ${label(job)} left the blocked state (${job.state || 'gone'}). Back to monitoring.`);
@@ -185,6 +215,24 @@ export async function bgWatchTick(state, {
       st.attempts = 0;
       st.gaveUp = false;
       st.waitUntil = 0;
+      st.awaiting = false;
+      st.awaitingUntil = 0;
+      continue;
+    }
+
+    // Blocked, but NOT on a usage limit — needs is empty (a queued retry turn
+    // running under the stale flag, or the daemon simply not saying) or names
+    // another cause (a permission prompt). Never this pipeline's failure family:
+    // arm no wait, send nothing.
+    if (!isRateLimited(job.needs || '', config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
+      if (st.status === 'waiting' || st.gaveUp) {
+        await log.info(`Background session ${label(job)} no longer shows a limit banner (needs ${job.needs ? 'changed' : 'cleared'}). Back to monitoring.`);
+        outcome = 'user-continued';
+        st.status = 'monitoring';
+        st.attempts = 0;
+        st.gaveUp = false;
+        st.waitUntil = 0;
+      }
       continue;
     }
 
@@ -201,6 +249,8 @@ export async function bgWatchTick(state, {
       st.lastNeeds = job.needs;
       st.attempts = 0;
       st.gaveUp = false;
+      st.awaiting = false;
+      st.awaitingUntil = 0;
       const secs = Math.max(0, Math.round((until - now()) / 1000));
       await log.info(rearm
         ? `Background session ${label(job)} re-blocked with a new reset: "${ellipsis(message)}". Waiting ${secs}s...`
@@ -221,7 +271,9 @@ export async function bgWatchTick(state, {
     }
 
     st.attempts += 1;
-    await log.info(`Sending retry message to background session ${label(job)} (attempt ${st.attempts}).`);
+    st.awaiting = true;
+    st.awaitingUntil = now() + BG_SETTLE_MS;
+    await log.info(`Sending retry message to background session ${label(job)} (attempt ${st.attempts}); standing down until the agent comes back.`);
     await replier(job.short, config.retryMessage);
     // Cooldown between attempts — same backoff shape the pane monitor uses after a
     // send (a rejected turn re-blocks on the next poll; don't hammer the provider).
