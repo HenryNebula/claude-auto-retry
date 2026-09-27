@@ -205,8 +205,56 @@ const RESET_PATTERNS = [
   // exactly like the clock-only form, so the run-on veto (#73) measures the same tail.
   new RegExp(`resets?\\s+(?:on\\s+)?${MONTH}\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s+(?:at\\s+)?\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)?`, 'i'),
   /resets?\s+in[:\s]\s*\d/i,                                   // "resets in: 3 hours"
-  /try again in \d+\s*(?:hours?|minutes?|h|m)/i,               // "try again in 5 hours"
+  // Seconds joined the units once OpenAI-compatible providers started reaching Claude Code:
+  // their TPM limit reads "Please try again in 7s." — the same clause with a unit the
+  // hours/minutes alternation refused. Seconds-scale clauses are still usage-path waits
+  // (parsed relative), so the seconds land in parseResetTime's relative branch.
+  /try again in \d+\s*(?:hours?|minutes?|seconds?|secs?|h|m|s)/i,  // "try again in 5 hours" / "in 7s"
 ];
+
+// --- Provider limit patterns (config `limitPatterns`) ---
+// Claude Code fronts many providers' coding plans through ANTHROPIC_BASE_URL, and each
+// renders its own 429 vocabulary: Z.AI "[1308][Usage limit reached for 5 hour. Your limit
+// will reset at 2026-09-27 06:03:10][…]" (read natively by the ISO clauses above), Kimi's
+// plan limit phrased as "The engine is currently overloaded, please try again later" (no
+// reset time at all), OpenAI-compat "Rate limit reached for <model> … Please try again in
+// 7s.", and banners in languages the English clauses cannot read. Rather than grow a
+// pattern per provider, a config entry teaches the pipeline one provider's shapes:
+//
+//   { "name": "my-provider",
+//     "limit":  "…regex a line NAMES this provider's limit (detection + extraction)",
+//     "reset":  "…regex whose capture group 1 IS the reset time (fed to the parser)",
+//     "requireReset": false,      // limit line alone fires (provider prints no reset time)
+//     "utcOffsetMinutes": 480,    // provider wall clock is UTC+8; skips tz calibration
+//     "limitHours": 0.5 }         // bounds/caps the wait when no instant is readable
+//
+// Discipline mirrors the built-ins: `limit` joins the limit vocabulary (pairing, the
+// #73 render rescue, the extraction fallback pass) and `reset` joins the reset clauses
+// (pairing + the presenting pass), each still subject to the tool-echo mask, the spinner
+// mask, chrome skip and the tail window. requireReset defaults true — the built-in
+// limit+reset pairing IS the false-positive defense, so a provider that names no reset
+// time is an explicit opt-in ("I own this tradeoff"), the same posture customPatterns
+// already take.
+function compileLimitPatterns(entries) {
+  const out = [];
+  if (!Array.isArray(entries)) return out;
+  for (const e of entries) {
+    if (!e || typeof e.limit !== 'string' || !e.limit) continue;
+    let limit;
+    try { limit = new RegExp(e.limit, 'i'); } catch { continue; }
+    let reset = null;
+    if (typeof e.reset === 'string' && e.reset) {
+      try { reset = new RegExp(e.reset, 'i'); } catch { reset = null; }
+    }
+    out.push({
+      name: typeof e.name === 'string' && e.name ? e.name : 'custom',
+      limit,
+      reset,
+      requireReset: e.requireReset !== false,
+    });
+  }
+  return out;
+}
 
 // --- Renders vs prose (#73) ---
 // A pane line may MENTION a limit or a reset time without BEING one. `/try again in/i` is
@@ -327,7 +375,11 @@ function resetClauseTail(line) {
 // True when the line PRESENTS a reset time rather than mentioning one — the eligibility
 // test for findRateLimitMessage's first pass. Also answers "does this line carry a reset
 // time at all", so the clause matchers run once per line rather than twice.
-function presentsResetTime(line) {
+// `extraLimitPatterns` carries the compiled `limit` regexes from config limitPatterns: a
+// line naming a limit in a provider's own vocabulary gets the same uniform rescue a line
+// naming a built-in one does — the rescue can only make a line eligible, so widening it
+// with user-vetted vocabulary cannot demote anything.
+function presentsResetTime(line, extraLimitPatterns = []) {
   const tail = resetClauseTail(line);
   if (tail === null) return false;
   // Absolute: the input row is the user's, whatever it says about limits.
@@ -337,6 +389,7 @@ function presentsResetTime(line) {
   // punctuated, glyphed, or trailed. See the cost argument above: this is the direction the
   // errors are allowed to fall.
   if (NAMES_A_LIMIT.some((p) => p.test(line))) return true;
+  if (extraLimitPatterns.some((p) => p.test(line))) return true;
   if (BULLET_GLYPH.test(line) && !BULLET_LEADS_WITH_CLAUSE.test(line)) return false;
   if (SENTENCE_END.test(line)) return false;
   // Parenthesised qualifiers are furniture; punctuation and box-drawing are not words.
@@ -463,7 +516,8 @@ export function toolEchoMask(lines) {
 // the input is captured process output, not a scrolling TUI). The USAGE_CREDITS companion
 // (defined above) backstops a banner buried behind a widget the chrome allowlist doesn't
 // recognize — trusted only when it sits in the live region (nothing but chrome below it).
-export function isRateLimited(text, customPatterns = [], tailLines = 0) {
+export function isRateLimited(text, customPatterns = [], tailLines = 0, limitPatterns = []) {
+  const providers = compileLimitPatterns(limitPatterns);
   const all = stripAnsi(text).split('\n');
   // Chrome-aware window: trailing UI furniture doesn't consume the tail budget.
   // Tool-echo mask (#63), TUI only: print mode scans process output where quoted error
@@ -531,12 +585,32 @@ export function isRateLimited(text, customPatterns = [], tailLines = 0) {
   // single-line messages and multi-line TUI renders). Internal-retry spinners are
   // invisible here as both the limit and the reset anchor — a live turn is not a
   // terminal banner however much banner text its truncation exposes.
+  // A configured provider's `limit` joins the limit vocabulary and its `reset` joins the
+  // reset pool — same pairing, same window, same masks; the entry just widens the words.
+  const providerLimits = providers.map((e) => e.limit);
+  const providerResets = providers.map((e) => e.reset).filter(Boolean);
+  const resetPool = providerResets.length > 0 ? [...RESET_PATTERNS, ...providerResets] : RESET_PATTERNS;
   const spinner = lines.map(isInternalRetryLine);
   for (let i = 0; i < lines.length; i++) {
     if (spinner[i] || (mask && mask[i])) continue;
-    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))) {
-      if (hasNearbyMatch(lines, i, RESET_PATTERNS, combineMask(mask, spinner))) return true;
+    // Provider `limit` vocabulary is refused on the user's own input row: the entry is
+    // user-curated to a banner shape, and the one pane line that can quote that shape
+    // without being a render is the ❯ row asking about it.
+    const lineLimit = LIMIT_PATTERNS.some((p) => p.test(lines[i]))
+      || (!PROMPT_GLYPH.test(lines[i]) && providerLimits.some((p) => p.test(lines[i])));
+    if (lineLimit) {
+      if (hasNearbyMatch(lines, i, resetPool, combineMask(mask, spinner))) return true;
     }
+  }
+
+  // A provider that prints NO reset time (Kimi's plan limit is "The engine is currently
+  // overloaded, please try again later" — wording that names no reset anywhere) can't
+  // satisfy the pairing. Its entry opts out explicitly with requireReset:false — then a
+  // bare limit-line match in the live window fires, the same tradeoff customPatterns make
+  // (and still safer: windowed, masked, spinner-excluded, rather than raw whole-tail).
+  for (let i = 0; i < lines.length; i++) {
+    if (spinner[i] || (mask && mask[i]) || PROMPT_GLYPH.test(lines[i])) continue;
+    if (providers.some((e) => !e.requireReset && e.limit.test(lines[i]))) return true;
   }
 
   return false;
@@ -550,7 +624,9 @@ export function isRateLimited(text, customPatterns = [], tailLines = 0) {
 // renders its new work BELOW the banner; working lines above it are history. When no
 // banner is in the window (scrolled away after a real resume, or entered via custom
 // patterns), fall back to plain isWorking — same behavior as before.
-export function resumedAfterLimit(text, tailLines = 0) {
+export function resumedAfterLimit(text, tailLines = 0, limitPatterns = []) {
+  const providers = compileLimitPatterns(limitPatterns);
+  const providerLimits = providers.map((e) => e.limit);
   const all = stripAnsi(text).split('\n');
   const { start, end } = tailLines > 0 ? contentTailRange(all, tailLines)
     : { start: 0, end: all.length };
@@ -559,7 +635,8 @@ export function resumedAfterLimit(text, tailLines = 0) {
   let lastLimit = -1;
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
-    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))) lastLimit = i;
+    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))
+      || providerLimits.some((p) => p.test(lines[i]))) lastLimit = i;
   }
   if (lastLimit === -1) return isWorking(text);
   return lines.slice(lastLimit + 1).some(isWorkingLine);
@@ -864,7 +941,10 @@ export function isInternalRetry(text) {
 const ISO_DATE_EOL = /\d{4}-\d{2}-\d{2}\s*$/;
 const TIME_BOL = /^\s*\d{2}:\d{2}:\d{2}\b/;
 
-export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
+export function findRateLimitMessage(text, customPatterns = [], tailLines = 0, limitPatterns = []) {
+  const providers = compileLimitPatterns(limitPatterns);
+  const providerLimits = providers.map((e) => e.limit);
+  const providerReset = (line) => providers.some((e) => e.reset && e.reset.test(line));
   const all = stripAnsi(text).split('\n');
   // Tool-echo mask (#63): without it, a quoted "resets 9am" in a fresh grep line below a
   // real banner would win the bottom-up scan and be parsed instead of the banner.
@@ -881,7 +961,7 @@ export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
   // a banner, and the bottom-up scan must fall through it to the real render above.
   const skip = (i) => fullMask[i] || isChromeLine(lines[i]) || isInternalRetryLine(lines[i]);
   const isReset = (i) => RESET_PATTERNS.some(p => p.test(lines[i]));
-  const presentsReset = (i) => presentsResetTime(lines[i]);
+  const presentsReset = (i) => presentsResetTime(lines[i], providerLimits);
 
   // Scan from the bottom up — the most recent line is the live one. The Claude TUI never
   // clears earlier rate-limit messages from scrollback, so a forward scan would lock onto
@@ -903,6 +983,18 @@ export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
   // I know" is what inverts freshness, one unrecognised render at a time.
   for (let i = lines.length - 1; i >= 0; i--) {
     if (skip(i)) continue;
+    // A configured provider's `reset` regex identifies its reset line by the user's own
+    // vocabulary — checked ahead of the built-in presenting test because it is the MORE
+    // specific statement about this pane. The prompt-glyph veto still applies (the user's
+    // input row is never a render), and tool echo / chrome / spinner were skipped above.
+    if (providerReset(lines[i]) && !PROMPT_GLYPH.test(lines[i])) {
+      const first = lines[i].trim();
+      if (ISO_DATE_EOL.test(lines[i]) && i + 1 < lines.length && !skip(i + 1)
+          && TIME_BOL.test(lines[i + 1])) {
+        return `${first} ${lines[i + 1].trim()}`;
+      }
+      return first;
+    }
     // Rejoin the wrapped-ISO shape before returning (see ISO_DATE_EOL): the clock the
     // parser needs may sit on the very next physical row.
     if (presentsReset(i)) {
@@ -924,10 +1016,15 @@ export function findRateLimitMessage(text, customPatterns = [], tailLines = 0) {
   }
 
   // Fallback: any "limit" line, also scanned from the bottom. Renders carrying no reset at
-  // all land here — the spend-limit banner (#71).
+  // all land here — the spend-limit banner (#71), and a provider whose `limit` vocabulary
+  // is configured but whose reset regex didn't match this line. Provider vocabulary is
+  // refused on the user's own input row, for the same reason the pairing loop refuses it.
   for (let i = lines.length - 1; i >= 0; i--) {
     if (skip(i)) continue;
-    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))) return lines[i].trim();
+    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))
+      || (!PROMPT_GLYPH.test(lines[i]) && providerLimits.some((p) => p.test(lines[i])))) {
+      return lines[i].trim();
+    }
   }
 
   return null;

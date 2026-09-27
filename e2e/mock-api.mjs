@@ -13,6 +13,15 @@
 //    reset at <resetWall>][<tag>]"
 // where <tag> is the request time in the PROVIDER's clock (UTC+8, like the real gateway).
 // That tag is what tz-calibration reads: tag − entry-UTC-timestamp = +480 min.
+//
+// `style` in the state file selects the provider whose banner shape is replayed (the
+// monitor must handle each through a DIFFERENT mechanism):
+//   zai (default) — the ISO + provider-tag shape above (rejoin/completion/calibration)
+//   openai        — OpenAI-compat TPM wording with a RELATIVE-seconds clause; the seconds
+//                   count down as the real gateway's would (recomputed per request)
+//   kimi          — Moonshot's plan limit, which names NO reset time at all and is
+//                   phrased as an overload; detection is only possible through a config
+//                   limitPatterns entry the orchestrator seeds before launch
 import { createServer } from 'node:http';
 import { readFileSync, appendFileSync } from 'node:fs';
 
@@ -45,6 +54,27 @@ function providerTag() {
 
 function limited(state) {
   return state.mode === 'limited' && Date.now() < state.resetUtcMs;
+}
+
+// The 429 error.message per provider style. Claude Code renders
+// "● API Error: Request rejected (429) · <message>" — the prefix is ITS text, so each
+// body starts where the provider's own message starts.
+function limitedMessage(state) {
+  switch (state.style) {
+    case 'openai': {
+      // A real TPM window counts down; so does ours (recomputed at each request, so the
+      // terminal banner Claude Code finally renders carries the remaining seconds).
+      const secsLeft = Math.max(1, Math.ceil((state.resetUtcMs - Date.now()) / 1000));
+      return `Rate limit reached for claude-sonnet-5 in organization org-e2e on tokens `
+        + `per min (TPM): Limit: 30000, Used: 29999, Requested: 221. `
+        + `Please try again in ${secsLeft}s.`;
+    }
+    case 'kimi':
+      return 'The engine is currently overloaded, please try again later';
+    default:
+      return `[1308][Usage limit reached for 5 hour. `
+        + `Your limit will reset at ${state.resetWall}][${providerTag()}]`;
+  }
 }
 
 function sseBody(text) {
@@ -81,12 +111,8 @@ const server = createServer((req, res) => {
     }
 
     if (limited(state)) {
-      // Claude Code renders "● API Error: Request rejected (429) · <message>" — the status
-      // text is ITS prefix, so the body starts at [1308] (the real gateway's shape; a
-      // duplicated prefix here shifts the wrap off the incident's date/clock split).
-      const message = `[1308][Usage limit reached for 5 hour. `
-        + `Your limit will reset at ${state.resetWall}][${providerTag()}]`;
-      log(`POST /v1/messages → 429 limited (reset ${state.resetWall})`);
+      const message = limitedMessage(state);
+      log(`POST /v1/messages → 429 limited (style ${state.style || 'zai'})`);
       // Retry-After: 1 keeps Claude Code's internal attempt-N/10 loop short (a real
       // gateway would send the true wait; the harness needs the TERMINAL banner to
       // render within seconds so the monitor has the full window to work against).

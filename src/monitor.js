@@ -1,5 +1,5 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, detectStreamInterrupted, streamInterruptedMatch, nearLimitWrapUpMatch, isWorking, isInternalRetry, resumedAfterLimit } from './patterns.js';
-import { parseResetTime, calculateWaitMs } from './time-parser.js';
+import { parseLimitReset, calculateWaitMs } from './time-parser.js';
 import { completeDateOnlyReset } from './session-jsonl.js';
 import { calibrateTimezoneFromHistory } from './tz-calibrate.js';
 import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
@@ -112,8 +112,10 @@ async function checkForeground(tmuxAdapter, pane, config) {
 // reset-shaped text anywhere in the capture outrank the live banner (see the tailLines note
 // on findRateLimitMessage).
 export async function usageWaitUntil(stripped, config, tzCache = null) {
-  let message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES);
-  let parsed = message ? parseResetTime(message) : null;
+  let message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns);
+  // Generic clauses first; a configured provider entry may then upgrade the parse with
+  // its own `reset` capture and supplies utcOffsetMinutes/limitHours for its shapes.
+  let { parsed, entry } = parseLimitReset(message, config.limitPatterns);
   // Date-only scrape (wrapped/abbreviated banner): the clock exists in the session's
   // JSONL as an isApiErrorMessage entry — complete the read from there before computing
   // the wait. On success this lands on the exact reset (still tz-calibrated below), and
@@ -125,10 +127,16 @@ export async function usageWaitUntil(stripped, config, tzCache = null) {
     if (completed) {
       message = `${message} [clock completed from session history: ${completed.isoDateTimeStr}]`;
       parsed = completed;
+      // The JSONL entry carries the provider's clock too — an entry-declared offset
+      // still applies, and must survive the completion swapping the parsed object.
+      if (entry && Number.isFinite(entry.utcOffsetMinutes)
+          && parsed.needsTzCalibration && parsed.offsetMinutes === undefined) {
+        parsed.offsetMinutes = entry.utcOffsetMinutes;
+      }
     }
   }
   let offsetMinutes = null;
-  if (parsed && parsed.needsTzCalibration) {
+  if (parsed && parsed.needsTzCalibration && parsed.offsetMinutes === undefined) {
     // A successful calibration for this exact reset string is immutable for the life of
     // the monitor — serve it from the memo instead of re-scanning the transcript store
     // on every correctable tick (see _tzCache). Nulls retry, by design.
@@ -149,7 +157,14 @@ export async function usageWaitUntil(stripped, config, tzCache = null) {
       } catch {}
     }
   }
-  const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours, new Date(), offsetMinutes);
+  // An entry's limitHours bounds the wait when no instant was readable — the difference
+  // between a usable no-reset provider (Kimi's ~20-min plan limit) and a blind 5h default.
+  // It caps rather than replaces the configured fallback, so a user's smaller global
+  // fallbackWaitHours always wins.
+  const fallbackHours = entry && Number.isFinite(entry.limitHours)
+    ? Math.min(config.fallbackWaitHours, entry.limitHours)
+    : config.fallbackWaitHours;
+  const waitMs = calculateWaitMs(parsed, config.marginSeconds, fallbackHours, new Date(), offsetMinutes);
   const until = Date.now() + waitMs;
   return { message, parsed, until };
 }
@@ -200,7 +215,7 @@ async function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
 const WAIT_CORRECTION_EPSILON_MS = 1000;
 async function correctUsageWait(state, stripped, config) {
   if (!state._waitIsFallback) return null;
-  if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) return null;
+  if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) return null;
   const { message, parsed, until } = await usageWaitUntil(stripped, config, state._tzCache);
   if (!parsed || until > state.waitUntil - WAIT_CORRECTION_EPSILON_MS) return null;
   state.waitUntil = until;
@@ -297,7 +312,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // through to 'retried'/'user-continued' would otherwise leave the message set for the
     // next plain 'waiting' tick to log as a spurious fresh detection.
     const correctedMessage = await correctUsageWait(state, stripped, config);
-    if (Date.now() < state.waitUntil && !resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES)) {
+    if (Date.now() < state.waitUntil && !resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
       if (!correctedMessage) return 'waiting';
       state.lastRateLimitMessage = correctedMessage;
       return 'wait-corrected';
@@ -310,7 +325,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // captured scrollback after a successful resume — spamming an actively-working
     // session (and a banner re-printed by another process keeps it "rate-limited" the
     // whole time). Resumed ⇒ the session continued; never inject into it.
-    if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES) || resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES)) {
+    if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns) || resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
       state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
       state._waitIsFallback = false;
       return 'user-continued';
@@ -364,7 +379,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       // Self-recovery: Claude resumed during the backoff → don't interrupt it.
       if (isWorking(stripped)) { resetOverload(state); state.status = 'monitoring'; return 'overload-cleared'; }
       // A usage limit appearing mid-wait still takes precedence.
-      if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) { resetOverload(state); return await enterUsageWait(state, stripped, config); }
+      if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) { resetOverload(state); return await enterUsageWait(state, stripped, config); }
 
       const foregroundOk = await checkForeground(tmuxAdapter, pane, config);
       if (!foregroundOk.ok) {
@@ -393,7 +408,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     const capMs = overload.maxTotalWaitMinutes * 60_000;
 
     // Usage-limit takes precedence: hand off to the (hours-scale) reset path.
-    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
       resetOverload(state);
       return await enterUsageWait(state, stripped, config);
     }
@@ -466,7 +481,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     const safeguard = config.safeguard;
 
     // A usage limit or Claude resuming takes precedence / means recovery.
-    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
       resetSafeguard(state); return await enterUsageWait(state, stripped, config);
     }
     // In flight (our retry, or the user typing continued things). Defer WITHOUT consuming
@@ -522,7 +537,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     const interrupted = config.streamInterrupted;
 
     // A usage limit or Claude resuming takes precedence / means recovery.
-    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+    if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
       resetInterrupted(state); return await enterUsageWait(state, stripped, config);
     }
     // In flight (our resume, or the user typing) — defer WITHOUT consuming or resetting
@@ -571,7 +586,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   // guard already stops injection into a working session, which is enough to prevent the
   // background-agent spam; the cost of dropping the gate is only a cosmetic re-detection
   // cycle (detect → wait → user-continued) that never actually injects.
-  if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+  if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns)) {
     return await enterUsageWait(state, stripped, config);
   }
 

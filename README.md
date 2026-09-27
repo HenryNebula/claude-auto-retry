@@ -198,8 +198,69 @@ Optional. Create `~/.claude-auto-retry.json`:
 | `fallbackWaitHours` | `5` | Wait time if reset time can't be parsed |
 | `retryMessage` | `"Continue where..."` | Message sent to Claude on retry |
 | `customPatterns` | `[]` | Additional regex patterns to detect rate limits |
+| `limitPatterns` | `[]` | Provider banner shapes — see below |
 
 All fields optional. Invalid values fall back to defaults automatically.
+
+### Provider limit patterns (`limitPatterns`)
+
+Claude Code fronts many providers' coding plans through `ANTHROPIC_BASE_URL`, and each
+renders its **own** 429 vocabulary. The built-in clauses read Anthropic's banners, the
+Z.AI-style ISO reset (`[1308][Usage limit reached for 5 hour. Your limit will reset at
+2026-09-27 06:03:10][…]`, calibrated from the provider tag), and OpenAI-compat TPM
+wording (`Rate limit reached for <model> … Please try again in 52s.` — the
+relative-seconds clause). For everything else, teach the pipeline your provider's shapes:
+
+```json
+{
+  "limitPatterns": [
+    {
+      "name": "my-provider",
+      "limit":  "用量已达上限",
+      "reset":  "将于\\s*(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})",
+      "utcOffsetMinutes": 480,
+      "limitHours": 5
+    }
+  ]
+}
+```
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `limit` | yes | Regex — a line **naming** this provider's limit (detection + extraction) |
+| `reset` | no | Regex whose **capture group 1** is the reset time; re-parsed by the time clauses |
+| `requireReset` | no | `false` lets the limit line alone fire (default `true` keeps the limit+reset pairing) |
+| `utcOffsetMinutes` | no | The provider wall clock's UTC offset (`480` = UTC+8); skips tz calibration |
+| `limitHours` | no | Bounds the wait when no instant is readable; also caps the fallback wait |
+
+A `reset` capture holding an ISO datetime, an offset-bearing ISO (`…+08:00` — absolute,
+no calibration needed), a clock, or a duration (`3 hours`, `7s`) all parse — ISO digits
+are language-neutral, which is what makes non-English banners capturable at all: the
+regex's capture does the vocabulary work, the parser does the arithmetic.
+
+Two observed shapes worth knowing:
+
+- **Kimi (Moonshot) for Coding** phrases its plan rate limit as `The engine is currently
+  overloaded, please try again later` — no reset time, and wording that looks like an
+  overload. Detection is only possible through an entry with `requireReset: false`; the
+  observed window is ~20 minutes, so pair it with `limitHours` (e.g. `0.5`) rather than
+  the 5-hour fallback:
+
+  ```json
+  { "name": "kimi-coding", "limit": "engine is currently overloaded",
+    "requireReset": false, "limitHours": 0.5 }
+  ```
+- **OpenAI-compatible endpoints** (proxies, routers) usually need nothing: the TPM shape
+  matches the built-in clauses and its `try again in Ns` waits N seconds + margin. A
+  `You exceeded your current quota` banner is a billing state, not a time window —
+  waiting won't clear it, so it's better left unconfigured (or given a small
+  `limitHours` if your gateway recovers on its own schedule).
+
+Provider entries keep every built-in discipline: the tail window, the tool-echo and
+internal-retry masks, chrome skipping, and the user-input-row veto — plus `requireReset`
+defaulting to the same limit+reset pairing the built-ins use. The Docker E2E replays
+all three shapes against a real Claude Code TUI (`E2E_STYLE=zai|openai|kimi npm run
+test:e2e`).
 
 ### Launch wrapper
 

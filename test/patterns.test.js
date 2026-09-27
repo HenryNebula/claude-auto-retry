@@ -1118,3 +1118,96 @@ describe('internal-retry spinner is invisible to limit detection', () => {
     assert.equal(isRateLimited(pane, [], 12), true);
   });
 });
+
+// --- Provider limit patterns (config `limitPatterns`) ---
+// Claude Code fronts many providers' coding plans through ANTHROPIC_BASE_URL and each
+// renders its own 429 vocabulary. The fixtures below are the observed shapes: OpenAI-
+// compatible TPM limits (built-in detection — "rate limit" + "try again in 52s"), a
+// Chinese provider banner (fully config-driven), and Kimi's plan limit, which Moonshot
+// phrases as "engine overloaded" and which names NO reset time anywhere.
+describe('provider limit patterns', () => {
+  const OPENAI_TPM = [
+    'work line',
+    '● API Error: Request rejected (429) · Rate limit reached for gpt-5.2 in organization org-8sh1 on tokens per min (TPM): Limit: 3000000, Used: 2999987, Requested: 2211. Please try again in 52s. Visit https://api.openai.com/docs/guides/rate-limits to learn more.',
+    '',
+    '❯ ',
+  ].join('\n');
+  const CHINESE_BANNER = '● API Error: 请求过于频繁，您本时段的用量已达上限，将于 2026-09-27 18:03:10 重置';
+  const KIMI_BANNER = '● API Error: Request rejected (429) · The engine is currently overloaded, please try again later';
+  const chineseEntry = {
+    name: 'custom-provider',
+    limit: '用量已达上限',
+    reset: '将于\\s*(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})',
+  };
+  const kimiEntry = {
+    name: 'kimi-coding',
+    limit: 'engine is currently overloaded',
+    requireReset: false,
+    limitHours: 0.5,
+  };
+
+  it('an OpenAI-compat TPM limit detects through the BUILT-IN clauses (no config)', () => {
+    assert.equal(isRateLimited(OPENAI_TPM, [], 12), true);
+  });
+
+  it('a Chinese banner is detected, and its line extracted, via a config entry', () => {
+    const pane = ['work line', CHINESE_BANNER, '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [chineseEntry]), true);
+    assert.equal(findRateLimitMessage(pane, [], 12, [chineseEntry]), CHINESE_BANNER);
+  });
+
+  it('a Chinese banner is invisible without the entry (the built-ins read English only)', () => {
+    const pane = ['work line', CHINESE_BANNER, '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12), false);
+    assert.equal(findRateLimitMessage(pane, [], 12), null);
+  });
+
+  it('a limit line alone does not fire — requireReset defaults to the pairing discipline', () => {
+    // Kimi's wording names no reset time; without an explicit opt-in the entry must not
+    // fire (the built-in limit+reset pairing IS the false-positive defense).
+    const pane = ['work line', KIMI_BANNER, '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [{ ...kimiEntry, requireReset: undefined }]), false);
+  });
+
+  it('requireReset:false lets a no-reset provider fire (the user owns that tradeoff)', () => {
+    const pane = ['work line', KIMI_BANNER, '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [kimiEntry]), true);
+    assert.equal(findRateLimitMessage(pane, [], 12, [kimiEntry]), KIMI_BANNER);
+  });
+
+  it('provider vocabulary quoted inside a tool-echo render stays masked (#63 discipline)', () => {
+    const pane = [
+      '● Bash(grep "engine is currently overloaded" log.txt)',
+      '  ⎿  Error: The engine is currently overloaded, please try again later',
+      '',
+      '❯ ',
+    ].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [kimiEntry]), false);
+  });
+
+  it('provider vocabulary on the internal-retry spinner stays invisible', () => {
+    // A live turn still failing ("✻ 429 <provider text> · Retrying in 4s · attempt 4/10")
+    // must not open an hours-scale wait, whatever vocabulary the truncation exposes.
+    const pane = [
+      `✻ 429 The engine is currently overloaded · Retrying in 4s · attempt 4/10`,
+      '',
+      '❯ ',
+    ].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [kimiEntry]), false);
+  });
+
+  it('the user\'s own input row quoting a provider reset is not extracted', () => {
+    const pane = ['work line', `❯ 它说 用量已达上限 将于 2026-09-27 18:03:10 重置，对吗`, '', '❯ '].join('\n');
+    assert.equal(findRateLimitMessage(pane, [], 12, [chineseEntry]), null);
+  });
+
+  it('a no-reset provider\'s custom limit line is picked up by the extraction fallback pass', () => {
+    const pane = ['work line', KIMI_BANNER, '', '❯ '].join('\n');
+    assert.equal(findRateLimitMessage(pane, [], 12, [kimiEntry]), KIMI_BANNER);
+  });
+
+  it('invalid limit regexes are ignored, not thrown', () => {
+    const pane = ['work line', CHINESE_BANNER, '', '❯ '].join('\n');
+    assert.equal(isRateLimited(pane, [], 12, [{ limit: '([unclosed' }]), false);
+  });
+});

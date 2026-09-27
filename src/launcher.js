@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { getCurrentPane, buildSetWindowOptionArgs } from './tmux.js';
 import { isRateLimited } from './patterns.js';
-import { parseResetTime, calculateWaitMs } from './time-parser.js';
+import { parseLimitReset, calculateWaitMs } from './time-parser.js';
 import { loadConfig } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -264,7 +264,7 @@ async function launchPrintMode(args) {
 
     const combined = result.stdout + result.stderr;
 
-    if (!isRateLimited(combined, config.customPatterns)) {
+    if (!isRateLimited(combined, config.customPatterns, 0, config.limitPatterns)) {
       // Clean exit — write buffered output
       process.stdout.write(result.stdout);
       process.stderr.write(result.stderr);
@@ -278,8 +278,13 @@ async function launchPrintMode(args) {
       return 1;
     }
 
-    const parsed = parseResetTime(combined);
-    const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+    // Provider patterns contribute their reset capture / offset / limit cap here too —
+    // print mode sees the same provider 429 bodies the TUI does.
+    const { parsed, entry } = parseLimitReset(combined, config.limitPatterns);
+    const fallbackHours = entry && Number.isFinite(entry.limitHours)
+      ? Math.min(config.fallbackWaitHours, entry.limitHours)
+      : config.fallbackWaitHours;
+    const waitMs = calculateWaitMs(parsed, config.marginSeconds, fallbackHours);
 
     process.stderr.write(`[claude-auto-retry] Rate limited. Waiting ${Math.round(waitMs / 1000)}s before retry ${retries}/${config.maxRetries}...\n`);
     await new Promise((r) => setTimeout(r, waitMs));

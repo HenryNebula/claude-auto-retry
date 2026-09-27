@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Non-Anthropic provider banners are now readable, and teachable from config.** Claude
+  Code fronts many providers' coding plans through `ANTHROPIC_BASE_URL`, and each renders
+  its own 429 vocabulary — the built-in clauses only knew Anthropic's wording, Z.AI's
+  bracketed ISO reset, and hours/minutes relative spans. Three generalizations ship:
+  an OpenAI-compat TPM limit now detects and parses through the built-ins (its
+  "Please try again in 52s." clause carries a unit the relative parser refused —
+  seconds are now a first-class unit, and the same banner with an explicit ISO offset
+  "resets at 2026-09-27T18:03:10+08:00" parses as an ABSOLUTE instant, no calibration
+  possible or needed); a provider whose reset appears in the banner but not in a shape
+  the clauses read (a non-English wording, a bare datetime without "reset at") is taught
+  via a `limitPatterns` config entry — `limit` names the banner line, `reset`'s capture
+  group 1 IS the reset time and re-parses through the normal clauses (ISO digits are
+  language-neutral), `utcOffsetMinutes` supplies the provider's clock when calibration
+  can't (no provider tag to derive one from), and `limitHours` bounds the wait; and a
+  provider that names NO reset time at all (Kimi for Coding's plan limit is phrased
+  "The engine is currently overloaded, please try again later" — no reset, wording that
+  reads like an overload) is an explicit `requireReset: false` opt-in whose entry-capped
+  fallback keeps the wait proportional (its observed window is ~20 min, not the 5h
+  default). Entries keep every built-in discipline — the tail window, tool-echo and
+  internal-retry masks, chrome skip, and the user-input-row veto — and `requireReset`
+  defaults to the same limit+reset pairing the built-ins use, so teaching a provider new
+  words cannot loosen the false-positive posture. All three shapes are proven in the
+  Docker E2E (`E2E_STYLE=zai|openai|kimi npm run test:e2e`) against a real Claude Code
+  TUI, and `customPatterns` keep their raw-tail semantics unchanged.
 - **A date-only reset scrape is completed from the session transcripts.** Custom-provider
   429s are persisted by Claude Code to the session JSONL as assistant entries flagged
   `isApiErrorMessage: true`, carrying the banner verbatim — so when the screen yields only
@@ -43,7 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computed once and served from a state-level memo; failed calibrations are deliberately
   not memoized, preserving the retry-until-the-transcript-flushes behavior.
 - **A wrapped ISO reset banner no longer parks the session ~2h past the real reset.**
-- **A wrapped ISO reset banner no longer parks the session ~2h past the real reset.**
   Custom-provider 429s render one long line — "● API Error: Request rejected (429) ·
   [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10][…]" —
   and in a pane narrower than that line the TUI wraps it at a space, exactly the one
@@ -58,7 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the hour clause; and a date-only wait is bounded by the banner's own limit window
   ("reached for 5 hour" ⇒ ≤5h) while staying correctable, so the live banner keeps being
   re-read and the wait shortens the moment a fuller render appears.
-- **A weekly-limit banner with a calendar date is now detected and parsed.** Weekly limits
 - **A weekly-limit banner with a calendar date is now detected and parsed.** Weekly limits
   render their reset with a date — "You've hit your weekly limit · resets Aug 21 at 3pm
   (Australia/Brisbane)", a real Claude Code record surfaced by PR #56's fixture — and both

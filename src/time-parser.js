@@ -6,7 +6,9 @@ const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', '
 // 2026-09-27" used to match this clause with hour=20 (the greedy \d{1,2} prefix of
 // "2026"), silently turning a wrapped banner into "today at 8pm" — see ISO_DATE_ONLY_REGEX.
 const RESET_TIME_REGEX = /resets?\s+(?:on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(?:at\s+)?(\d{1,2})(?!\d)(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i;
-const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|h|m)\b/i;
+// Seconds joined the units for OpenAI-compatible providers whose TPM limit reads
+// "Please try again in 7s" — same clause, unit the hours/minutes alternation refused.
+const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|seconds?|secs?|h|m|s)\b/i;
 
 // ISO wall-clock datetime emitted by custom LLM providers — e.g. the format:
 //   "Your limit will reset at 2026-09-13 02:29:27"
@@ -14,7 +16,10 @@ const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(
 // We parse it naively (treating it as UTC for arithmetic purposes) and return a
 // special `isoWallClockMs` shape so that calculateWaitMs can apply a calibrated
 // UTC offset supplied by the caller (see tz-calibrate.js).
-const ISO_DATETIME_REGEX = /reset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/i;
+// The offset group (optional) covers providers that DO state their zone —
+// "reset at 2026-09-27T18:03:10+08:00" (or `Z`, or `+0800`) — which makes the instant
+// absolute: no calibration, no fallback, one Date.parse.
+const ISO_DATETIME_REGEX = /reset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(Z|[+-]\d{2}:?\d{2})?/i;
 // The same render with the clock missing: "… will reset at 2026-09-27". Two sources:
 // a provider that names only the day, and — the observed incident — a pane too narrow
 // for the whole banner, where the TUI wraps the line exactly at the space between the
@@ -32,13 +37,28 @@ export function parseResetTime(text) {
   if (isoMatch) {
     // Normalise the separator so Date.parse works on both "T" and " " variants.
     const normalised = isoMatch[1].replace(' ', 'T');
+    const durMatch = text.match(/limit reached for\s+(\d+)\s*(?:hour|h|minute|min)/i);
+    const limitHours = durMatch ? parseInt(durMatch[1], 10) : null;
+    // An explicit offset makes the instant absolute — Date.parse does the conversion.
+    // "+0800" is not spec-shaped, so insert the colon before handing it over.
+    if (isoMatch[2]) {
+      const off = isoMatch[2] === 'Z' ? 'Z' : isoMatch[2].replace(/([+-]\d{2})(\d{2})/, '$1:$2');
+      const absoluteMs = Date.parse(`${normalised}${off}`);
+      if (Number.isFinite(absoluteMs)) {
+        return {
+          absoluteMs,
+          isoDateTimeStr: `${isoMatch[1]}${isoMatch[2]}`,
+          limitHours,
+          rawText: text,
+          needsTzCalibration: false,
+        };
+      }
+    }
     // Parse as if UTC — we don't know the real timezone yet.  The caller can
     // supply an offsetMinutes value (from tz-calibrate.calibrateTimezoneFromHistory)
     // to convert this to a true UTC epoch.
     const naiveMs = Date.parse(`${normalised}Z`);
     if (Number.isFinite(naiveMs)) {
-      const durMatch = text.match(/limit reached for\s+(\d+)\s*(?:hour|h|minute|min)/i);
-      const limitHours = durMatch ? parseInt(durMatch[1], 10) : null;
       return {
         isoWallClockMs: naiveMs,
         isoDateTimeStr: isoMatch[1],
@@ -100,17 +120,75 @@ export function parseResetTime(text) {
     return { hour, minute, timezone, ambiguous };
   }
 
-  // Try relative time: "try again in 5 minutes" / "wait 2 hours"
+  // Try relative time: "try again in 5 minutes" / "wait 2 hours" / "try again in 7s"
   const relMatch = text.match(RELATIVE_TIME_REGEX);
   if (relMatch) {
     const amount = parseInt(relMatch[1], 10);
     const unit = relMatch[2].toLowerCase();
     const isMinutes = unit.startsWith('m');
-    const ms = amount * (isMinutes ? 60_000 : 3_600_000);
+    const isSeconds = unit.startsWith('s');
+    const ms = amount * (isSeconds ? 1_000 : isMinutes ? 60_000 : 3_600_000);
     return { relative: true, waitMs: ms };
   }
 
   return null;
+}
+
+// Parse a scraped limit banner the way the USAGE-WAIT path needs it: the generic clauses
+// first, then — when config limitPatterns teach a provider's shapes — the first entry
+// whose `limit` regex matches the banner gets to contribute:
+//   - its `reset` capture (group 1) is fed to the clauses as a time span (verbatim, as
+//     a duration, then as an instant), which routes a bare ISO datetime, an
+//     offset-bearing ISO, a clock, or a relative span through the parser above without
+//     it learning the provider's wording (a Chinese banner captures the language-neutral
+//     datetime digits; the words stay the regex's job). The capture only UPGRADES a null
+//     or date-only generic parse — a full built-in read wins.
+//   - its `utcOffsetMinutes`/`limitHours` attach to the parse when it came from this
+//     entry (capture-adopted, absent, or date-only), never over a generic full read.
+// Returns { parsed, entry } so the caller can bound the fallback wait by entry.limitHours.
+export function parseLimitReset(message, limitPatterns = []) {
+  let parsed = message ? parseResetTime(message) : null;
+  if (!message || !Array.isArray(limitPatterns) || limitPatterns.length === 0) {
+    return { parsed, entry: null };
+  }
+  let entry = null;
+  let limit;
+  for (const e of limitPatterns) {
+    if (!e || typeof e.limit !== 'string') continue;
+    try { limit = new RegExp(e.limit, 'i'); } catch { continue; }
+    if (limit.test(message)) { entry = e; break; }
+  }
+  if (!entry) return { parsed, entry: null };
+  let viaCapture = false;
+  if (typeof entry.reset === 'string' && entry.reset && (!parsed || parsed.isoDateOnly)) {
+    try {
+      const m = message.match(new RegExp(entry.reset, 'i'));
+      if (m && m[1]) {
+        // The capture is a TIME SPAN, not a sentence — feed it to the clauses three ways,
+        // loosest-first: verbatim (captures that kept their own words, "try again in 7s"),
+        // as a duration ("resets in 3 hours" — a bare "3 hours" capture must NOT be read
+        // by the clock clause as 3am, so the duration reading comes first), then as an
+        // instant ("resets at <datetime|clock>"). ISO digits are language-neutral, which
+        // is what makes a non-English banner capturable at all.
+        const cap = m[1].trim();
+        const p2 = parseResetTime(cap)
+          ?? parseResetTime(`resets in ${cap}`)
+          ?? parseResetTime(`resets at ${cap}`);
+        if (p2) { parsed = p2; viaCapture = true; }
+      }
+    } catch { /* invalid regex: config validation drops these, but never crash a tick */ }
+  }
+  if (viaCapture || !parsed || parsed.isoDateOnly) {
+    if (Number.isFinite(entry.utcOffsetMinutes) && parsed
+        && parsed.needsTzCalibration && parsed.offsetMinutes === undefined) {
+      parsed.offsetMinutes = entry.utcOffsetMinutes;
+    }
+    if (Number.isFinite(entry.limitHours) && entry.limitHours > 0 && parsed
+        && parsed.limitHours == null) {
+      parsed.limitHours = entry.limitHours;
+    }
+  }
+  return { parsed, entry };
 }
 
 // Reset-boundary grace window. A live limit banner whose parsed reset time is already in
@@ -131,9 +209,18 @@ const RESET_GRACE_MS = 60 * 60 * 1000; // 1 hour
 export function calculateWaitMs(parsed, marginSeconds = 60, fallbackHours = 5, now = new Date(), offsetMinutes = null) {
   if (!parsed) return (fallbackHours * 3600 + marginSeconds) * 1000;
 
-  // Handle relative times: "try again in 5 minutes"
+  // Handle relative times: "try again in 5 minutes" / "in 7s"
   if (parsed.relative) {
     return parsed.waitMs + marginSeconds * 1000;
+  }
+
+  // Handle an offset-bearing ISO datetime ("reset at 2026-09-27T18:03:10+08:00"): the
+  // instant is absolute — no calibration to wait for, no fallback. Checked ahead of the
+  // naive-ISO branch, which would otherwise discard the offset and park the wait on a
+  // calibration that can never succeed (no provider tag to derive one from).
+  if (parsed.absoluteMs !== undefined) {
+    const diff = parsed.absoluteMs - now.getTime();
+    return Math.max(0, diff) + marginSeconds * 1000;
   }
 
   // Handle ISO wall-clock datetime from custom LLM providers.

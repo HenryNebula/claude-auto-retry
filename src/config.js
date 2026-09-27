@@ -121,6 +121,7 @@ export const DEFAULT_CONFIG = {
   fallbackWaitHours: 5,
   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
   customPatterns: [],
+  limitPatterns: [],
   overload: DEFAULT_OVERLOAD,
   safeguard: DEFAULT_SAFEGUARD,
   streamInterrupted: DEFAULT_STREAM_INTERRUPTED,
@@ -205,6 +206,43 @@ function validateNudge(raw, defaults) {
   return b;
 }
 
+// Provider limit patterns (`limitPatterns`): teach the usage-limit pipeline one
+// provider's banner shapes. Each entry: `limit` (required regex — a line NAMES this
+// provider's limit), `reset` (optional regex whose capture group 1 IS the reset time),
+// plus the optional tuning keys. Entries with an uncompilable `limit` are dropped; a
+// bad `reset` drops only the reset (the limit vocabulary is still useful — e.g. a
+// spend-limit-shaped provider with no reset line). Mirrors validPatterns' "a typo'd
+// pattern can't crash the monitor tick" posture.
+function validateLimitPatterns(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.limit !== 'string' || !compiles(entry.limit)) continue;
+    const e = {
+      limit: entry.limit,
+      name: typeof entry.name === 'string' && entry.name ? entry.name : `limit-pattern-${out.length + 1}`,
+      requireReset: typeof entry.requireReset === 'boolean' ? entry.requireReset : true,
+    };
+    if (typeof entry.reset === 'string' && compiles(entry.reset)) e.reset = entry.reset;
+    if (typeof entry.utcOffsetMinutes === 'number' && Number.isFinite(entry.utcOffsetMinutes)
+        && Math.abs(entry.utcOffsetMinutes) < 1440) {
+      e.utcOffsetMinutes = entry.utcOffsetMinutes;
+    }
+    if (typeof entry.limitHours === 'number' && Number.isFinite(entry.limitHours)
+        && entry.limitHours > 0) {
+      e.limitHours = entry.limitHours;
+    }
+    out.push(e);
+  }
+  return out;
+}
+
+function compiles(pattern) {
+  if (!pattern) return false;
+  try { new RegExp(pattern); return true; } catch { return false; }
+}
+
 function validate(cfg) {
   cfg.maxRetries = validNumber(cfg.maxRetries, 1, DEFAULT_CONFIG.maxRetries);
   cfg.pollIntervalSeconds = validNumber(cfg.pollIntervalSeconds, 1, DEFAULT_CONFIG.pollIntervalSeconds);
@@ -226,6 +264,7 @@ function validate(cfg) {
       delete cfg.foregroundCommands;
     }
   }
+  cfg.limitPatterns = validateLimitPatterns(cfg.limitPatterns);
   cfg.overload = validateOverload(cfg.overload);
   cfg.safeguard = validateBoundedRetry(cfg.safeguard, DEFAULT_SAFEGUARD);
   cfg.streamInterrupted = validateBoundedRetry(cfg.streamInterrupted, DEFAULT_STREAM_INTERRUPTED);

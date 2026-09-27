@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseResetTime, calculateWaitMs } from '../src/time-parser.js';
+import { parseResetTime, calculateWaitMs, parseLimitReset } from '../src/time-parser.js';
 
 describe('parseResetTime', () => {
   it('parses "resets 3pm (Europe/Dublin)"', () => {
@@ -285,5 +285,133 @@ describe('calculateWaitMs — date-only ISO reset', () => {
 describe('parseResetTime — truncated spinner text is not a date-only reset', () => {
   it('rejects a date followed by an ellipsis (internal-retry spinner truncation)', () => {
     assert.equal(parseResetTime('Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 … · Retrying in 4s'), null);
+  });
+});
+
+// --- Provider reset shapes: seconds-relative, offset-bearing ISO, config captures ---
+describe('parseResetTime — provider shapes', () => {
+  it('reads a seconds-relative clause ("Please try again in 52s" — OpenAI-compat TPM)', () => {
+    const parsed = parseResetTime('Rate limit reached for gpt-5.2 on tokens per min (TPM). Please try again in 52s.');
+    assert.ok(parsed && parsed.relative);
+    assert.equal(parsed.waitMs, 52_000);
+  });
+
+  it('reads a bare seconds unit without a trailing period', () => {
+    const parsed = parseResetTime('resets in 7s');
+    assert.ok(parsed && parsed.relative);
+    assert.equal(parsed.waitMs, 7_000);
+  });
+
+  it('an offset-bearing ISO datetime is ABSOLUTE — no calibration needed (+08:00)', () => {
+    const parsed = parseResetTime('Your limit will reset at 2026-09-27T18:03:10+08:00');
+    assert.ok(parsed);
+    assert.equal(parsed.absoluteMs, Date.parse('2026-09-27T18:03:10+08:00'));
+    assert.equal(parsed.needsTzCalibration, false);
+    assert.equal(parsed.isoWallClockMs, undefined);
+  });
+
+  it('accepts the compact offset form (+0800) and Z', () => {
+    const compact = parseResetTime('reset at 2026-09-27 18:03:10+0800');
+    assert.equal(compact.absoluteMs, Date.parse('2026-09-27T18:03:10+08:00'));
+    const utc = parseResetTime('reset at 2026-09-27T10:03:10Z');
+    assert.equal(utc.absoluteMs, Date.parse('2026-09-27T10:03:10Z'));
+  });
+
+  it('a naive ISO datetime still needs calibration (unchanged Z.AI behavior)', () => {
+    const parsed = parseResetTime('Your limit will reset at 2026-09-27 06:03:10');
+    assert.equal(parsed.needsTzCalibration, true);
+    assert.equal(parsed.absoluteMs, undefined);
+  });
+});
+
+describe('calculateWaitMs — provider shapes', () => {
+  it('a seconds-relative clause waits the seconds plus the margin', () => {
+    const wait = calculateWaitMs({ relative: true, waitMs: 52_000 }, 60);
+    assert.equal(wait, 112_000);
+  });
+
+  it('an absolute ISO reset waits exactly until the instant plus margin', () => {
+    const now = new Date();
+    const target = now.getTime() + 3 * 3600_000;
+    const parsed = { absoluteMs: target };
+    const wait = calculateWaitMs(parsed, 60, 5, now);
+    assert.equal(wait, 3 * 3600_000 + 60_000);
+  });
+
+  it('an absolute reset already in the past waits just the margin', () => {
+    const now = new Date();
+    const parsed = { absoluteMs: now.getTime() - 600_000 };
+    assert.equal(calculateWaitMs(parsed, 60, 5, now), 60_000);
+  });
+});
+
+describe('parseLimitReset — config-taught provider parses', () => {
+  const chineseEntry = {
+    name: 'cn-provider',
+    limit: '用量已达上限',
+    reset: '将于\\s*(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})',
+    utcOffsetMinutes: 480,
+  };
+
+  it('a Chinese banner parses via the capture, with the entry-declared offset', () => {
+    const banner = 'API Error: 请求过于频繁，您本时段的用量已达上限，将于 2026-09-27 18:03:10 重置';
+    const { parsed, entry } = parseLimitReset(banner, [chineseEntry]);
+    assert.equal(entry.name, 'cn-provider');
+    assert.ok(parsed && parsed.needsTzCalibration);
+    assert.equal(parsed.isoDateTimeStr, '2026-09-27 18:03:10');
+    assert.equal(parsed.offsetMinutes, 480);
+  });
+
+  it('a capture of a plain ISO WITH offset is absolute — no offset attach, no calibration', () => {
+    const e = { name: 'x', limit: 'quota reached', reset: 'at\\s+(\\S+\\s\\S+)', };
+    const banner = 'quota reached, at 2026-09-27T18:03:10+08:00 exactly';
+    const { parsed } = parseLimitReset(banner, [e]);
+    assert.equal(parsed.absoluteMs, Date.parse('2026-09-27T18:03:10+08:00'));
+    assert.equal(parsed.needsTzCalibration, false);
+  });
+
+  it('a duration capture reads as a duration, not a clock ("3 hours" ≠ 3am)', () => {
+    const e = { name: 'x', limit: 'limit', reset: 'retry after\\s+(.+)$' };
+    const { parsed } = parseLimitReset('limit hit, retry after 3 hours', [e]);
+    assert.ok(parsed && parsed.relative);
+    assert.equal(parsed.waitMs, 3 * 3600_000);
+  });
+
+  it('a verbatim capture with its own clause words parses directly ("try again in 7s")', () => {
+    const e = { name: 'x', limit: 'limit', reset: 'please\\s(.+?)\\.' };
+    const { parsed } = parseLimitReset('limit. please try again in 7s.', [e]);
+    assert.ok(parsed && parsed.relative);
+    assert.equal(parsed.waitMs, 7_000);
+  });
+
+  it('a full generic parse beats the entry capture (no downgrade)', () => {
+    const banner = 'Usage limit reached for 5 hour. Your limit will reset at 2026-09-27 06:03:10';
+    const e = { name: 'x', limit: 'usage limit', reset: '(\\d{4}-\\d{2}-\\d{2})', utcOffsetMinutes: 0 };
+    const { parsed } = parseLimitReset(banner, [e]);
+    assert.equal(parsed.isoDateTimeStr, '2026-09-27 06:03:10');
+    assert.equal(parsed.offsetMinutes, undefined);   // entry offset must NOT override
+  });
+
+  it('a date-only generic parse IS upgraded by the entry capture', () => {
+    const banner = 'limit hit; will reset at 2026-09-27';    // date-only (wrapped banner shape)
+    const e = { name: 'x', limit: 'limit', reset: 'reset at\\s+(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})' };
+    const { parsed } = parseLimitReset('limit hit; will reset at 2026-09-27 18:03:10', [e]);
+    assert.ok(parsed && !parsed.isoDateOnly);
+    assert.equal(parsed.isoDateTimeStr, '2026-09-27 18:03:10');
+  });
+
+  it('a no-reset entry (Kimi shape) returns parsed:null plus the entry for fallback capping', () => {
+    const { parsed, entry } = parseLimitReset(
+      'API Error: The engine is currently overloaded, please try again later',
+      [{ name: 'kimi', limit: 'engine is currently overloaded', requireReset: false, limitHours: 0.5 }],
+    );
+    assert.equal(parsed, null);
+    assert.equal(entry.limitHours, 0.5);
+  });
+
+  it('entries whose limit does not match contribute nothing', () => {
+    const { parsed, entry } = parseLimitReset('unrelated text', [chineseEntry]);
+    assert.equal(entry, null);
+    assert.equal(parsed, null);
   });
 });

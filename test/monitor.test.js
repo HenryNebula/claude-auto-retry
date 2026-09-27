@@ -760,3 +760,76 @@ describe('tz calibration memoization', () => {
     assert.ok(s._tzCache['2026-09-27'], 'state cache populated on first detection');
   });
 });
+
+// --- Config-taught provider banners in the full usage-wait path ---
+// The pipeline from pane text to wake-up instant, with provider shapes the built-ins
+// can't read: a Chinese banner with an entry capture + declared UTC offset, an
+// offset-bearing ISO (absolute), an OpenAI-compat seconds-relative TPM limit (built-in),
+// and Kimi's no-reset plan limit (entry-capped fallback).
+describe('usageWaitUntil — provider limit patterns', () => {
+  const margin = 60;
+  const providerConfig = (limitPatterns, extra = {}) => ({
+    ...DEFAULT_CONFIG, marginSeconds: margin, fallbackWaitHours: 5, limitPatterns, ...extra,
+  });
+  const pad = (n) => String(n).padStart(2, '0');
+
+  it('a Chinese banner waits to the captured instant, shifted by the declared offset', async () => {
+    const resetUtcMs = Date.now() + 3 * 3600_000;
+    const wall = new Date(resetUtcMs + 480 * 60_000);
+    const wallStr = `${wall.getUTCFullYear()}-${pad(wall.getUTCMonth() + 1)}-${pad(wall.getUTCDate())} ${pad(wall.getUTCHours())}:${pad(wall.getUTCMinutes())}:${pad(wall.getUTCSeconds())}`;
+    const pane = [
+      'work line',
+      `● API Error: 请求过于频繁，您本时段的用量已达上限，将于 ${wallStr} 重置`,
+      '',
+      '❯ ',
+    ].join('\n');
+    const config = providerConfig([{
+      name: 'cn-provider',
+      limit: '用量已达上限',
+      reset: '将于\\s*(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})',
+      utcOffsetMinutes: 480,
+    }]);
+    const { parsed, until } = await usageWaitUntil(pane, config);
+    assert.ok(parsed && parsed.needsTzCalibration);
+    assert.equal(parsed.offsetMinutes, 480);
+    // wall clock (UTC+8) minus 8h = the UTC reset; plus margin. Tolerance for tick drift.
+    assert.ok(Math.abs(until - (resetUtcMs + margin * 1000)) < 5_000,
+      `until ${(until - resetUtcMs) / 1000}s from reset, expected ~${margin}s`);
+  });
+
+  it('an offset-bearing ISO reset is absolute — no calibration, latch closed', async () => {
+    const resetUtcMs = Date.now() + 2 * 3600_000;
+    const wall = new Date(resetUtcMs + 480 * 60_000);
+    const wallStr = `${wall.getUTCFullYear()}-${pad(wall.getUTCMonth() + 1)}-${pad(wall.getUTCDate())}T${pad(wall.getUTCHours())}:${pad(wall.getUTCMinutes())}:${pad(wall.getUTCSeconds())}+08:00`;
+    const pane = ['work line', `● API Error: Your quota resets at ${wallStr}`, '', '❯ '].join('\n');
+    const { parsed, until } = await usageWaitUntil(pane, DEFAULT_CONFIG);
+    assert.equal(parsed.needsTzCalibration, false);
+    assert.ok(Math.abs(until - (resetUtcMs + margin * 1000)) < 5_000);
+  });
+
+  it('an OpenAI-compat TPM limit (built-in clauses) waits seconds + margin', async () => {
+    const pane = [
+      'work line',
+      '● API Error: Request rejected (429) · Rate limit reached for gpt-5.2 in organization org-8sh1 on tokens per min (TPM): Limit: 3000000, Used: 2999987, Requested: 2211. Please try again in 52s. Visit https://api.openai.com/docs/guides/rate-limits to learn more.',
+      '',
+      '❯ ',
+    ].join('\n');
+    const { parsed, until } = await usageWaitUntil(pane, DEFAULT_CONFIG);
+    assert.ok(parsed && parsed.relative && parsed.waitMs === 52_000);
+    assert.ok(Math.abs(until - (Date.now() + 112_000)) < 5_000);
+  });
+
+  it("Kimi's no-reset plan limit lands on the entry-capped fallback, correctable", async () => {
+    const pane = ['work line',
+      '● API Error: Request rejected (429) · The engine is currently overloaded, please try again later',
+      '', '❯ '].join('\n');
+    const config = providerConfig([{
+      name: 'kimi-coding', limit: 'engine is currently overloaded',
+      requireReset: false, limitHours: 0.25,
+    }]);
+    const { parsed, until } = await usageWaitUntil(pane, config);
+    assert.equal(parsed, null);
+    // 0.25h fallback (not the 5h default) + margin — the entry's limitHours caps it.
+    assert.ok(Math.abs(until - (Date.now() + 0.25 * 3600_000 + margin * 1000)) < 5_000);
+  });
+});

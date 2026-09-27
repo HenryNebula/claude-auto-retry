@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# E2E: the wrapped-banner incident, replayed against a real Claude Code TUI.
+# E2E: provider rate-limit banners, replayed against a real Claude Code TUI.
 #
-# Timeline:
+# E2E_STYLE selects the provider shape under test (see e2e/README.md):
+#   zai (default) — the wrapped-banner incident: ISO reset in a UTC+8 wall clock,
+#                   detected via rejoin/JSONL-completion/tz-calibration.
+#   openai        — OpenAI-compat TPM wording with a relative-seconds clause; detected
+#                   by the built-in clauses, waited as seconds + margin.
+#   kimi          — Moonshot's plan limit: names no reset time and is phrased as an
+#                   overload; detected ONLY through a seeded config limitPatterns entry,
+#                   waited on the entry-capped fallback.
+#
+# Timeline (zai; the others differ only in banner text and mechanism):
 #   1. claude (pinned version) runs in a 120-column tmux pane — sized so the provider's
 #      long 429 banner wraps exactly between the date and the clock, the shape the
 #      monitor mis-parsed for ~2h in production.
@@ -21,6 +30,14 @@ MOCK_LOG=/tmp/mock-api.log
 MONITOR_LOG_DIR=/root/.claude-auto-retry/logs
 STATE=/tmp/mock-state.json
 PROJ=/workspace/proj
+STYLE="${E2E_STYLE:-zai}"
+case "$STYLE" in
+  zai|openai|kimi) ;;
+  *) echo "FAIL: unknown E2E_STYLE '$STYLE' (zai|openai|kimi)" >&2; exit 2 ;;
+esac
+# zai needs the 120-col wrap (the incident's shape). The other styles test vocabulary,
+# not wrapping — 220 cols keeps their banners whole so the clause under test is one row.
+PANE_WIDTH=120; [ "$STYLE" != zai ] && PANE_WIDTH=220
 RESET_IN_MS=$((6 * 60 * 1000))     # true reset: 6 min out — past Claude Code's ~3-min
                                    # internal attempt-N/10 backoff, so the terminal
                                    # banner renders while the limit is still live
@@ -65,6 +82,21 @@ cat > /root/.claude.json <<'EOF'
 {"numStartups": 3, "hasCompletedOnboarding": true, "theme": "dark",
  "bypassPermissionsModeAccepted": true, "autoUpdaterStatus": "disabled"}
 EOF
+# kimi's banner names no reset time and matches no built-in clause — the ONLY way through
+# is a config limitPatterns entry. Seeding it here proves config-taught detection works
+# against a provider the tool has never seen. limitHours 0.09 caps the fallback wait to
+# ~5.4 min (the observed Kimi window is ~20 min; shortened for the harness), keeping the
+# wake after the 6-min reset.
+if [ "$STYLE" = kimi ]; then
+  cat > /root/.claude-auto-retry.json <<'EOF'
+{ "limitPatterns": [
+    { "name": "kimi-coding",
+      "limit": "engine is currently overloaded",
+      "requireReset": false,
+      "limitHours": 0.09 } ] }
+EOF
+  echo "   seeded limitPatterns entry for the kimi banner"
+fi
 
 echo "== starting mock api =="
 node "$APP/e2e/mock-api.mjs" >"$MOCK_LOG" 2>&1 &
@@ -76,11 +108,11 @@ for i in $(seq 1 20); do
 done
 grep -q 'listening' "$MOCK_LOG" || fail "mock api did not start"
 
-# 120 cols: the TUI's usable width (~cols-4) lands the banner's date at end-of-row
+# 120 cols (zai): the TUI's usable width (~cols-4) lands the banner's date at end-of-row
 # and the clock on the continuation row — the incident's date-only scrape.
-echo "== launching claude in a 120-col pane (the wrap width) =="
+echo "== launching claude in a ${PANE_WIDTH}-col pane =="
 cd "$PROJ"
-tmux new-session -d -x 120 -y 30 -s "$SESSION" \
+tmux new-session -d -x "$PANE_WIDTH" -y 30 -s "$SESSION" \
   "CLAUDE_AUTO_RETRY_ACTIVE=1 TERM=xterm-256color SHELL=/bin/bash node $APP/src/launcher.js"
 
 # Ready = input box rendered. Handle first-run dialogs defensively (trust prompt, theme).
@@ -101,14 +133,14 @@ tmux send-keys -t "$PANE" -l 'Say hi'
 tmux send-keys -t "$PANE" Enter
 wait_for 'e2e-mock-reply-1' 90 || fail "phase-1 reply never rendered"
 
-echo "== phase 2: flip to limited, reset in 6 minutes =="
+echo "== phase 2: flip to limited ($STYLE banner), reset in 6 minutes =="
 RESET_UTC_MS=$(( $(date +%s%3N) + RESET_IN_MS ))
 RESET_WALL=$(node -e "
   const d = new Date($RESET_UTC_MS + 8 * 3600e3);
   const p = (n, w = 2) => String(n).padStart(w, '0');
   process.stdout.write(\`\${d.getUTCFullYear()}-\${p(d.getUTCMonth()+1)}-\${p(d.getUTCDate())} \${p(d.getUTCHours())}:\${p(d.getUTCMinutes())}:\${p(d.getUTCSeconds())}\`);
 ")
-echo "{\"mode\":\"limited\",\"resetWall\":\"$RESET_WALL\",\"resetUtcMs\":$RESET_UTC_MS}" > "$STATE"
+echo "{\"mode\":\"limited\",\"style\":\"$STYLE\",\"resetWall\":\"$RESET_WALL\",\"resetUtcMs\":$RESET_UTC_MS}" > "$STATE"
 echo "   reset wall clock (UTC+8): $RESET_WALL"
 
 tmux send-keys -t "$PANE" -l 'Say hi again'
@@ -118,33 +150,67 @@ tmux send-keys -t "$PANE" Enter
 # does. The attempt-10/10 loop with exponential backoff takes ~3 minutes.
 wait_for 'API Error:' 300 || fail "the 429 banner never rendered"
 
-echo "== asserting the banner wrapped between date and clock =="
-WALL_DATE=${RESET_WALL%% *}          # YYYY-MM-DD
-WALL_TIME=${RESET_WALL#* }           # hh:mm:ss
-if ! capture 40 | grep -qE "reset at ${WALL_DATE}[[:space:]]*$"; then
-  fail "banner did not wrap at the date (tune tmux -x); pane above"
+if [ "$STYLE" = zai ]; then
+  echo "== asserting the banner wrapped between date and clock =="
+  WALL_DATE=${RESET_WALL%% *}          # YYYY-MM-DD
+  WALL_TIME=${RESET_WALL#* }           # hh:mm:ss
+  if ! capture 40 | grep -qE "reset at ${WALL_DATE}[[:space:]]*$"; then
+    fail "banner did not wrap at the date (tune tmux -x); pane above"
+  fi
+  if ! capture 40 | grep -A1 "reset at ${WALL_DATE}[[:space:]]*$" | grep -qE "^[[:space:]]*${WALL_TIME}"; then
+    fail "wrapped continuation does not lead with the clock; pane above"
+  fi
+  echo "   wrapped as in the incident: row 1 ends '${WALL_DATE}', row 2 leads '${WALL_TIME}'"
+elif [ "$STYLE" = openai ]; then
+  capture 40 | grep -q 'Rate limit reached' || fail "OpenAI-style banner never rendered; pane above"
+  capture 40 | grep -qE 'try again in [0-9]+s' || fail "relative-seconds clause missing; pane above"
+  echo "   OpenAI-compat banner with a relative-seconds clause rendered"
+else
+  capture 40 | grep -q 'engine is currently overloaded' || fail "Kimi-style banner never rendered; pane above"
+  echo "   Kimi banner rendered (names no reset time — config entry is its only path in)"
 fi
-if ! capture 40 | grep -A1 "reset at ${WALL_DATE}[[:space:]]*$" | grep -qE "^[[:space:]]*${WALL_TIME}"; then
-  fail "wrapped continuation does not lead with the clock; pane above"
-fi
-echo "   wrapped as in the incident: row 1 ends '${WALL_DATE}', row 2 leads '${WALL_TIME}'"
 
-echo "== monitor: recovered the exact reset from the wrapped banner =="
+echo "== monitor: detected the $STYLE limit and derived the right wait =="
 wait_for 'Rate limit detected' 60 monitor || fail "monitor never detected the limit"
 DETECT_LINE=$(grep 'Rate limit detected' "$MONITOR_LOG_DIR"/*.log | tail -1)
-echo "$DETECT_LINE" | grep -qF "reset at $RESET_WALL" \
-  || fail "extracted banner does not carry the full datetime $RESET_WALL (rejoin nor completion fired)"
-# The wait must be the exact reset + margin — not the 5h fallback, not a mis-parsed hour.
+# The wait must reflect the banner's own reset — never the 5h fallback.
 WAIT_S=$(echo "$DETECT_LINE" | grep -oE 'Waiting [0-9]+s' | grep -oE '[0-9]+')
-[ "${WAIT_S:-0}" -le 300 ] || fail "wait ${WAIT_S}s is not the exact reset (fallback or mis-parse)"
+case "$STYLE" in
+  zai)
+    echo "$DETECT_LINE" | grep -qF "reset at $RESET_WALL" \
+      || fail "extracted banner does not carry the full datetime $RESET_WALL (rejoin nor completion fired)"
+    [ "${WAIT_S:-0}" -le 300 ] || fail "wait ${WAIT_S}s is not the exact reset (fallback or mis-parse)"
+    ;;
+  openai)
+    echo "$DETECT_LINE" | grep -qF 'Rate limit reached' \
+      || fail "detection line does not carry the OpenAI-compat banner"
+    # seconds-left at detection (~3 min of internal retries) + 60s margin; never the fallback
+    [ "${WAIT_S:-0}" -ge 60 ] && [ "${WAIT_S:-0}" -le 480 ] \
+      || fail "wait ${WAIT_S}s is not the relative-seconds clause (fallback or mis-parse)"
+    ;;
+  kimi)
+    echo "$DETECT_LINE" | grep -qF 'engine is currently overloaded' \
+      || fail "detection line does not carry the Kimi banner (config entry never fired)"
+    # limitHours 0.09 (324s) + 60s margin = 384s — the entry-capped fallback
+    [ "${WAIT_S:-0}" -ge 300 ] && [ "${WAIT_S:-0}" -le 480 ] \
+      || fail "wait ${WAIT_S}s is not the entry-capped fallback (0.09h + margin = 384s)"
+    ;;
+esac
 echo "   $DETECT_LINE"
 if grep -q 'clock completed from session history' "$MONITOR_LOG_DIR"/*.log; then
   echo "   (date-only scrape was completed from session history)"
 fi
 
 echo "== waiting for the auto-resume at the true reset (no manual continue) =="
-DEADLINE_MS=$(( RESET_UTC_MS + 60000 + 120000 ))     # reset + margin + slack
-wait_for 'Sent retry message' 300 monitor || fail "monitor never sent the retry"
+# zai/openai wake ≈ reset+margin. kimi wakes on the entry-capped fallback
+# (~324s + margin from detection, itself ~3 min in) — a longer deadline for that path.
+if [ "$STYLE" = kimi ]; then
+  DEADLINE_MS=$(( RESET_UTC_MS + 60000 + 420000 ))
+  wait_for 'Sent retry message' 600 monitor || fail "monitor never sent the retry"
+else
+  DEADLINE_MS=$(( RESET_UTC_MS + 60000 + 120000 ))
+  wait_for 'Sent retry message' 300 monitor || fail "monitor never sent the retry"
+fi
 grep 'Sent retry message' "$MONITOR_LOG_DIR"/*.log | tail -1 | sed 's/^/   /'
 # A numbered reply ≥2 rendered near the bottom = the auto-sent turn completed. (The
 # retry may fire a main + an auxiliary request, so the visible reply number can be >2.)
@@ -166,4 +232,4 @@ echo "   monitor log: $(ls "$MONITOR_LOG_DIR"/*.log)"
 
 tmux kill-server 2>/dev/null || true
 kill "$MOCK_PID" 2>/dev/null || true
-echo "PASS: wrapped banner → full datetime recovered → auto-resumed at the true reset, no manual continue"
+echo "PASS [$STYLE]: ${STYLE} banner → detected → correct wait → auto-resumed at the true reset, no manual continue"
