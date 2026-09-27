@@ -6,7 +6,8 @@ import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } f
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
-import { writeStatus, clearStatus, sweepStaleStatus } from './status-file.js';
+import { writeStatus, clearStatus, readStatus, sweepStaleStatus } from './status-file.js';
+import { snapshotSrcFiles, srcFilesChanged, changedSrcNames, canImportFresh, restartSelf } from './code-drift.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -222,6 +223,40 @@ async function correctUsageWait(state, stripped, config) {
   state._waitIsFallback = Boolean(parsed.isoDateOnly
     || (parsed.needsTzCalibration && parsed.offsetMinutes === undefined));
   return message;
+}
+
+// Carry a still-pending usage wait across a monitor swap (the code-drift self-restart,
+// or reconcile re-arming a monitor whose predecessor died). A fresh monitor normally
+// re-derives everything from the screen — but a usage wait can outlive the banner it
+// came from: the conversation gets backgrounded, or a tall re-render scrolls the banner
+// out of the tail window, and there is nothing left on screen to re-read. That is
+// exactly how the 2026-09-27 incident's schedule would have been lost to the very fix
+// delivering it. When the status file holds a pending wait for THIS pane+claude PID,
+// adopt it instead of losing the schedule.
+//
+// claudePid must match: pane ids repeat across tmux servers, and the pair (pane, live
+// claude pid) is what ties the snapshot to this session — a predecessor's file left
+// behind after a crash only adopts when the very same claude process is still running
+// in the pane. The wait is adopted CORRECTABLE (_waitIsFallback true): a live banner
+// can still shorten it via correctUsageWait, and a lengthen is impossible either way;
+// with no banner visible the correction gate no-ops, so the latch being open is free.
+// Short-lived sub-states (overload/safeguard/interrupted, minutes-scale) are
+// deliberately NOT carried — a fresh monitor re-detects those from the screen within a
+// poll or two.
+export async function adoptPriorUsageWait(state, pane, pid, logger,
+    { readStatusFn = readStatus, nowMs = Date.now() } = {}) {
+  const prior = await readStatusFn(pane);
+  if (!prior || prior.claudePid !== pid) return false;
+  if (prior.status !== 'waiting' || typeof prior.waitUntil !== 'number') return false;
+  const waitUntilMs = prior.waitUntil * 1000;
+  if (!(waitUntilMs > nowMs)) return false;
+  state.status = 'waiting';
+  state.waitUntil = waitUntilMs;
+  state.attempts = Number.isFinite(prior.attempts) ? prior.attempts : 0;
+  state._gaveUp = !!prior.gaveUp;
+  state._waitIsFallback = true;
+  await logger.info(`Adopted a pending usage wait left by a previous monitor for this pane — resume scheduled at ${new Date(waitUntilMs).toISOString()}.`);
+  return true;
 }
 
 function enterOverload(state, overload, rand) {
@@ -745,6 +780,16 @@ export async function startMonitor(pane, pid) {
 
   await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
 
+  // Carry over a still-pending usage wait from a predecessor monitor (self-restart on a
+  // source change, or reconcile re-arming this pane). Best-effort: without a match the
+  // fresh monitor re-derives state from the screen, exactly as before.
+  await adoptPriorUsageWait(state, pane, pid, logger).catch(() => {});
+
+  // Source-drift baseline (see code-drift.js): re-checked once per tick so a monitor
+  // forked days ago picks up fixes without waiting for its claude to exit. Null (src/
+  // unreadable) disables the check rather than restarting on noise.
+  let srcBaseline = await snapshotSrcFiles().catch(() => null);
+
   // Best-effort GC of status files left behind by monitors that died without cleaning up
   // (SIGKILL, host sleep/crash). Runs once per monitor start, not per tick.
   sweepStaleStatus().catch(() => {});
@@ -793,6 +838,9 @@ export async function startMonitor(pane, pid) {
       // out for a large fraction of every tick). gaveUp flags the terminal states where
       // `status` alone doesn't tell a reader the monitor has stopped acting.
       await writeStatus(pane, {
+        // Identifies the claude process this snapshot belongs to, so a successor
+        // monitor can safely adopt a pending wait (see adoptPriorUsageWait).
+        claudePid: pid,
         status: state.status,
         waitUntil: Math.floor(state.waitUntil / 1000),
         overloadWaitUntil: Math.floor(state.overloadWaitUntil / 1000),
@@ -860,6 +908,23 @@ export async function startMonitor(pane, pid) {
       if (result === 'wrap-up-nudged') await logger.info(`Near-limit wrap-up notice at an idle prompt ("${state._wrapUpNotice}") — sent "${config.nearLimitWrapUp.retryMessage}" to pick the work back up (${state._wrapUpNudges}/${config.nearLimitWrapUp.maxRetries}).`);
       if (result === 'wrap-up-gave-up') await logger.warn(`Wrap-up notice still unanswered after ${config.nearLimitWrapUp.maxRetries} nudges — the nudge never rendered. Holding until it clears.`);
       if (result === 'interrupted-gave-up') await logger.warn(`Stream still truncated after ${config.streamInterrupted.maxRetries} resume attempts. Giving up — the connection may still be down after the wake. Will not retry until it clears.`);
+
+      // Source drift: swap into new code without giving up the pane. Runs AFTER the
+      // tick's own work (never mid-send) and after writeStatus above — that snapshot,
+      // now stamped with claudePid, is what carries a pending wait to the successor.
+      // The probe guards the exit: broken new code keeps this monitor running, and the
+      // baseline is re-armed against it so the swap retries on the next edit.
+      const srcNow = await snapshotSrcFiles().catch(() => null);
+      if (srcFilesChanged(srcBaseline, srcNow)) {
+        const names = changedSrcNames(srcBaseline, srcNow).join(', ');
+        if (await canImportFresh(process.execPath, process.argv[1])) {
+          await logger.info(`Source changed (${names}) — restarting monitor into the new code; a pending wait carries over via the status file.`);
+          restartSelf();
+        } else {
+          await logger.warn(`Source changed (${names}) but the new code failed to load — keeping the running version. Will retry the swap on the next change.`);
+          srcBaseline = srcNow;
+        }
+      }
     } catch (err) {
       consecutiveErrors++;
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});

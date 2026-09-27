@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Monitors pick up source changes without giving up their pane.** A monitor is forked
+  once per `claude` launch and then runs for days, executing the code that was on disk at
+  its spawn — so fixes never reached already-running sessions. Observed live on
+  2026-09-27: the wrapped/date-only banner recovery landed at 08:46, but the pane's
+  monitor, forked the evening before, still ran the old date-only→midnight-UTC parse and
+  parked a limited session until 20:01 — 6h17m past the real 13:43 reset — and would
+  have kept the bug for the session's whole lifetime. Each monitor now fingerprints its
+  `src/` directory (name:mtime:size per file, symlink-resolved so a globally `npm link`ed
+  install watches the dev checkout) on every tick; on a change it probes the new code in
+  a throwaway subprocess that imports the entry module, and only if that loads clean does
+  it re-exec itself, detached, with the same pane and claude PID — a broken edit keeps
+  the running version (a monitor restarted into a crash loop would be an unwatched pane)
+  and re-arms against the broken state so the swap retries on the next save. The swap
+  lands within one poll interval of the change. Config files are deliberately out of
+  scope: they carry user-facing knobs a silent restart should not flip mid-wait.
 - **Non-Anthropic provider banners are now readable, and teachable from config.** Claude
   Code fronts many providers' coding plans through `ANTHROPIC_BASE_URL`, and each renders
   its own 429 vocabulary — the built-in clauses only knew Anthropic's wording, Z.AI's
@@ -47,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   +60s margin, with no reliance on the pane rejoin.
 
 ### Fixed
+- **A pending usage wait survives a monitor replacement.** A fresh monitor re-derives
+  its state from the screen — but a usage wait can outlive the banner it came from (the
+  conversation gets backgrounded, a tall re-render scrolls the banner out of the tail
+  window), which is exactly how the wait above would have been lost to the very restart
+  delivering its fix. The status snapshot now carries the `claude` PID it belongs to, and
+  a starting monitor adopts a still-pending wait from a predecessor snapshot for the same
+  pane+PID pair (adopted correctable: a live banner can still shorten it, a lengthen is
+  impossible). This also repairs the reconcile re-arm path: a monitor that died mid-wait
+  and was re-armed within the staleness window resumes the schedule instead of
+  forgetting it. Short-lived sub-states (overload/safeguard/interrupted, minutes-scale)
+  are deliberately not carried — the screen re-yields them within a poll or two.
 - **Claude Code's internal-retry spinner can no longer be mistaken for a limit banner.**
   While Claude Code retries a 429 on its own ("✻ 429 … · Retrying in 4s · attempt 4/10"),
   the spinner hard-truncates the error text, and at some pane widths the truncation

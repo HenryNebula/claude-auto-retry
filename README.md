@@ -685,6 +685,22 @@ session (tmux reuses pane ids, so a hand-added `%pane` exclude could — pane id
 pruned, since staleness can't be detected). Prefer the PID form; you can also hand-add a
 `%pane` id or a PID to that file.
 
+**Picking up upgrades.** A monitor is forked once per `claude` launch and then runs for
+days — it keeps executing the code that was on disk at its spawn, so a fix pulled later
+(an `npm i -g` update, a `git pull` in a dev checkout) never reaches already-running
+sessions. To close that gap, each monitor fingerprints its `src/` directory on every
+tick, and when the files change it probes the new code in a throwaway subprocess
+(importing the entry module — a file that fails to parse or evaluate is left alone, so a
+broken edit can never restart a monitor into a crash loop and an unwatched pane) and then
+re-execs itself into the new code, detached, with the same pane and PID. A pending usage
+wait survives the swap: the successor adopts it from the status file (keyed to the same
+`claude` PID), because a wait whose banner has scrolled out of the visible tail — a
+backgrounded conversation, a tall re-render — cannot be re-derived from the screen. The
+swap lands within one poll interval of the change; watch for `Source changed … restarting
+monitor into the new code` in the log to confirm it. Config changes
+(`~/.claude-auto-retry.json`) are deliberately *not* hot-reloaded this way — restart the
+session to pick those up.
+
 ## Platform Support
 
 ### Operating Systems
