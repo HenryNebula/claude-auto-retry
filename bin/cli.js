@@ -461,6 +461,86 @@ async function cmdVersion() {
   }
 }
 
+// --- background sessions (claude agents / claude --bg fleet) ---
+
+// List the live background sessions the daemon hosts, with the structured state
+// the tmux monitors cannot see. --json for scripting.
+async function cmdBgList() {
+  const asJson = process.argv.includes('--json');
+  const { listBgSessions } = await import('../src/bg-sessions.js');
+  let jobs;
+  try {
+    jobs = await listBgSessions();
+  } catch (err) {
+    console.error(`bg list: ${err.message}`);
+    process.exit(1);
+  }
+  if (asJson) { console.log(JSON.stringify(jobs, null, 2)); return; }
+  if (jobs.length === 0) { console.log('No live background sessions.'); return; }
+  for (const j of jobs) {
+    const name = j.name || j.sessionId.slice(0, 8);
+    const needs = j.needs ? ` — ${j.needs.slice(0, 100)}${j.needs.length > 100 ? '…' : ''}` : '';
+    console.log(`${j.short || '?'}  ${name}  [${j.state}${j.tempo && j.tempo !== j.state ? `/${j.tempo}` : ''}]  ${j.cwd}${needs}`);
+  }
+}
+
+// Send a message to a running background session as a TURN over the daemon
+// control socket (op:reply) — no pane needed. <ref> is a short id / session id.
+async function cmdBgSend() {
+  const rest = process.argv.slice(4).filter(a => !a.startsWith('--'));
+  if (rest.length < 2) {
+    console.error('Usage: claude-auto-retry bg send <short-or-session-id> <message>');
+    process.exit(1);
+  }
+  const [ref, ...words] = rest;
+  const text = words.join(' ');
+  const { listBgSessions, replyToBgSession } = await import('../src/bg-sessions.js');
+  let jobs;
+  try {
+    jobs = await listBgSessions();
+  } catch (err) {
+    console.error(`bg send: ${err.message}`);
+    process.exit(1);
+  }
+  const job = jobs.find(j => j.short === ref || j.sessionId === ref
+    || (ref.length >= 4 && (j.short.startsWith(ref) || j.sessionId.startsWith(ref))));
+  if (!job) {
+    console.error(`bg send: no live background session matching "${ref}" (run "claude-auto-retry bg list")`);
+    process.exit(1);
+  }
+  try {
+    await replyToBgSession(job.short, text);
+    console.log(`Sent to ${job.short} (${job.name || job.cwd}): ${text}`);
+  } catch (err) {
+    console.error(`bg send: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// Watch the daemon roster and auto-continue rate-limited background sessions —
+// the pane monitor's usage-wait pipeline, driven against op:list/op:reply.
+async function cmdBgWatch() {
+  const i = process.argv.indexOf('--interval');
+  const intervalSeconds = i !== -1 ? parseFloat(process.argv[i + 1]) : null;
+  if (intervalSeconds !== null && !Number.isFinite(intervalSeconds)) {
+    console.error('bg watch: --interval needs a number of seconds');
+    process.exit(1);
+  }
+  const { runBgWatch } = await import('../src/bg-watch.js');
+  await runBgWatch({ intervalSeconds });
+}
+
+async function cmdBg() {
+  const sub = process.argv[3];
+  if (sub === 'list') return cmdBgList();
+  if (sub === 'send') return cmdBgSend();
+  if (sub === 'watch') return cmdBgWatch();
+  console.log('Usage: claude-auto-retry bg <list|send|watch> [args]');
+  console.log('  bg list [--json]     Live background sessions + state (blocked ones show their banner)');
+  console.log('  bg send <ref> <msg>  Deliver a message to a running background session');
+  console.log('  bg watch [--interval N]  Auto-continue rate-limited background sessions');
+}
+
 // --- Main ---
 const command = process.argv[2];
 
@@ -476,6 +556,7 @@ switch (command) {
   case 'uninstall-timer': await cmdUninstallTimer(); break;
   case 'status': await cmdStatus(); break;
   case 'logs': await cmdLogs(); break;
+  case 'bg': await cmdBg(); break;
   case 'version': case '--version': case '-v': await cmdVersion(); break;
   default:
     console.log('claude-auto-retry - Auto-retry Claude Code on subscription rate limits\n');
@@ -496,6 +577,10 @@ switch (command) {
     console.log('                                       on Linux, launchd LaunchAgent on macOS)');
     console.log('  claude-auto-retry uninstall-timer    Remove the reconcile timer');
     console.log('  claude-auto-retry status             Show monitor status');
+    console.log('  claude-auto-retry bg list|send|watch Manage background (claude agents / --bg)');
+    console.log('                                       sessions: list state, send a message, or');
+    console.log('                                       auto-continue rate-limited ones (no tmux');
+    console.log('                                       pane needed — talks to the claude daemon)');
     console.log('  claude-auto-retry logs               Tail today\'s log');
     console.log('  claude-auto-retry version            Print version');
     break;

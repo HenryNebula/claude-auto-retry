@@ -8,6 +8,11 @@ import { createLogger } from './logger.js';
 import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
 import { writeStatus, clearStatus, readStatus, sweepStaleStatus } from './status-file.js';
 import { snapshotSrcFiles, srcFilesChanged, changedSrcNames, canImportFresh, restartSelf } from './code-drift.js';
+// Circular by design: bg-watch imports usageWaitUntil from this module, and this
+// module embeds bg-watch's leader-gated duty in its tick loop. Both sides expose
+// hoisted function declarations only, so the ESM cycle resolves before anything
+// executes at module scope.
+import { bgWatchDuty, releaseBgWatchLock } from './bg-watch.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -112,7 +117,7 @@ async function checkForeground(tmuxAdapter, pane, config) {
 // Reads the SAME chrome-aware window the isRateLimited gate reads — an unbounded scan lets
 // reset-shaped text anywhere in the capture outrank the live banner (see the tailLines note
 // on findRateLimitMessage).
-export async function usageWaitUntil(stripped, config, tzCache = null) {
+export async function usageWaitUntil(stripped, config, tzCache = null, nowMs = Date.now()) {
   let message = findRateLimitMessage(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES, config.limitPatterns);
   // Generic clauses first; a configured provider entry may then upgrade the parse with
   // its own `reset` capture and supplies utcOffsetMinutes/limitHours for its shapes.
@@ -165,8 +170,8 @@ export async function usageWaitUntil(stripped, config, tzCache = null) {
   const fallbackHours = entry && Number.isFinite(entry.limitHours)
     ? Math.min(config.fallbackWaitHours, entry.limitHours)
     : config.fallbackWaitHours;
-  const waitMs = calculateWaitMs(parsed, config.marginSeconds, fallbackHours, new Date(), offsetMinutes);
-  const until = Date.now() + waitMs;
+  const waitMs = calculateWaitMs(parsed, config.marginSeconds, fallbackHours, new Date(nowMs), offsetMinutes);
+  const until = nowMs + waitMs;
   return { message, parsed, until };
 }
 
@@ -785,6 +790,15 @@ export async function startMonitor(pane, pid) {
   // fresh monitor re-derives state from the screen, exactly as before.
   await adoptPriorUsageWait(state, pane, pid, logger).catch(() => {});
 
+  // Background-session duty (see bg-watch.js): this monitor — whichever one in the
+  // fleet wins the bg-watch lock — also drives daemon-hosted sessions (claude
+  // agents / --bg) through the same usage-wait pipeline, on its own cadence.
+  // Infinity disables the duty entirely (bgWatch.enabled: false).
+  let nextBgDutyAt = config.bgWatch?.enabled ? 0 : Infinity;
+  let bgEverLed = false;
+  let bgDutyErrLogged = false;
+  const releaseBgDuty = () => (bgEverLed ? releaseBgWatchLock().catch(() => {}) : null);
+
   // Source-drift baseline (see code-drift.js): re-checked once per tick so a monitor
   // forked days ago picks up fixes without waiting for its claude to exit. Null (src/
   // unreadable) disables the check rather than restarting on noise.
@@ -798,12 +812,14 @@ export async function startMonitor(pane, pid) {
   const shutdown = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Best-effort: fire the unlink and exit without waiting on the promise. Signal
-    // handlers are not the place to await — a hung filesystem must not block the
-    // process from actually terminating on SIGTERM/SIGINT.
-    clearStatus(pane).catch(() => {}).finally(() => {
-      process.exit(signal === 'SIGINT' ? 130 : 143);
-    });
+    const exitCode = signal === 'SIGINT' ? 130 : 143;
+    // Best-effort cleanups (status file, bg-watch leadership), but AWAITED: a plain
+    // fire-and-forget races process.exit and loses — observed as the bg-watch lock
+    // surviving a SIGTERM'd monitor. A hard-exit timer backstops a hung filesystem
+    // so termination is never actually blocked.
+    setTimeout(() => process.exit(exitCode), 2000).unref?.();
+    Promise.allSettled([clearStatus(pane).catch(() => {}), releaseBgDuty()])
+      .finally(() => process.exit(exitCode));
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -826,6 +842,7 @@ export async function startMonitor(pane, pid) {
 
       if (result === 'exit') {
         await clearStatus(pane).catch(() => {});
+        releaseBgDuty();
         await logger.info('Claude exited. Monitor shutting down.');
         process.exit(0);
       }
@@ -909,6 +926,23 @@ export async function startMonitor(pane, pid) {
       if (result === 'wrap-up-gave-up') await logger.warn(`Wrap-up notice still unanswered after ${config.nearLimitWrapUp.maxRetries} nudges — the nudge never rendered. Holding until it clears.`);
       if (result === 'interrupted-gave-up') await logger.warn(`Stream still truncated after ${config.streamInterrupted.maxRetries} resume attempts. Giving up — the connection may still be down after the wake. Will not retry until it clears.`);
 
+      // Background-session duty, on its own cadence (bgWatch.tickSeconds). Errors
+      // are swallowed after one log — a missing/stopped daemon is the NORMAL state
+      // on machines that don't use background sessions, and a protocol break after
+      // a Claude Code upgrade must not spam the pane monitor's log forever.
+      if (Date.now() >= nextBgDutyAt) {
+        nextBgDutyAt = Date.now() + config.bgWatch.tickSeconds * 1000;
+        try {
+          const bgOutcome = await bgWatchDuty({ config, logger });
+          if (bgOutcome !== 'not-leader') bgEverLed = true;
+        } catch (err) {
+          if (!bgDutyErrLogged) {
+            bgDutyErrLogged = true;
+            await logger.warn(`Background-session duty failed (will keep retrying silently): ${err.message}`);
+          }
+        }
+      }
+
       // Source drift: swap into new code without giving up the pane. Runs AFTER the
       // tick's own work (never mid-send) and after writeStatus above — that snapshot,
       // now stamped with claudePid, is what carries a pending wait to the successor.
@@ -930,6 +964,7 @@ export async function startMonitor(pane, pid) {
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         await clearStatus(pane).catch(() => {});
+        releaseBgDuty();
         await logger.error(`${MAX_CONSECUTIVE_ERRORS} consecutive errors. Pane likely destroyed. Exiting.`).catch(() => {});
         process.exit(1);
       }

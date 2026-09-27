@@ -701,6 +701,45 @@ monitor into the new code` in the log to confirm it. Config changes
 (`~/.claude-auto-retry.json`) are deliberately *not* hot-reloaded this way — restart the
 session to pick those up.
 
+## Background sessions (`claude agents` / `claude --bg`)
+
+Claude Code hosts background sessions in a daemon (`claude agents`, `claude --bg`) —
+they never render into a tmux pane, so the pane monitors cannot see them. This
+package talks to that daemon directly, over its control socket:
+
+- **`claude-auto-retry bg list [--json]`** — the live fleet with structured state.
+  A rate-limited session shows as `blocked`, and its `needs` field carries the whole
+  limit banner verbatim — including the full reset datetime, unwrapped (better than
+  what the screen renders).
+- **`claude-auto-retry bg send <ref> <message>`** — deliver a message to a running
+  background session as a turn, over the daemon's `op:reply` (authenticated with
+  `~/.claude/daemon/control.key`). No pane, no keystrokes.
+- **`claude-auto-retry bg watch [--interval N]`** — a manual/on-demand watcher. You
+  normally don't need it: **every running monitor embeds the background-session
+  duty**. A lock file (`~/.claude-auto-retry/bg-watch.lock`) elects exactly one
+  monitor in the fleet as leader; it polls the roster every `bgWatch.tickSeconds`
+  (30s), detects `blocked` sessions, parses the reset from `needs` (same parser,
+  timezone calibration, and `limitHours` cap as the pane path), sends the retry
+  message at reset, verifies on the next poll, and re-tries up to `maxRetries`.
+  Waits and budgets persist to `status/bg-watch.json`, surviving monitor restarts
+  and leader rotation; `bg watch` goes through the same lock, so running it
+  alongside live monitors never double-drives a session. Opt out with
+  `bgWatch: {"enabled": false}` in `~/.claude-auto-retry.json`.
+
+```
+$ claude-auto-retry bg list
+8fbd17d9  Build Shazam-style song matcher…  [blocked]  ~/Code/music-lib — rate limited · … will reset at 2026-09-28 01:43:35…
+1f190c8f  Make TLDR message ephemeral…      [done/idle]  ~/Code/shell-helper
+```
+
+The protocol is reverse-engineered (ported from the Go reference
+[kvaps/claude-agents-mcp](https://github.com/kvaps/claude-agents-mcp), Apache-2.0)
+and version-coupled to Claude Code — the transport sits behind small functions in
+`src/bg-sessions.js` so it can be swapped for a first-party CLI verb without
+touching the wait logic. Resuming *exited* sessions is out of scope: a
+rate-limited session is live-but-blocked, and one that exited while limited is a
+fresh detection when it returns.
+
 ## Platform Support
 
 ### Operating Systems

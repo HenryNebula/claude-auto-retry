@@ -204,3 +204,39 @@ remove this class entirely by keying on a structured field instead of the render
 3. `ps`/`stop` + lifecycle hardening (§5) — independent, ship anytime.
 4. Full jitter (§3), 2-tick debounce (§7), print-mode parity (§8) — small, independent.
 5. Golden corpus (§9) alongside whichever detector becomes primary.
+
+## Appendix: the background-session daemon protocol (2026-09-27)
+
+Reverse-engineered facts the `bg` commands rely on, extracted from the Go reference
+[kvaps/claude-agents-mcp](https://github.com/kvaps/claude-agents-mcp) (Apache-2.0)
+and confirmed against the live daemon on this machine. All frames are
+newline-delimited JSON over the unix socket `/tmp/cc-daemon-<uid>/<instance>/control.sock`
+(freshest instance mtime wins; re-resolve per call — the instance dir rotates across
+daemon restarts):
+
+- `{"proto":1,"op":"list"}` → `{ok, error, jobs:[…]}` — unauthenticated. Each job:
+  `short` (8-hex worker id), `sessionId`, `pid`, `cwd`, `name`, `state`
+  (running|working|blocked|done), `tempo` (idle|active|blocked), `detail`, `needs`.
+  **`needs` on a rate-limited job carries the whole provider banner verbatim** — the
+  full reset datetime, unwrapped by any terminal width. This is a better detection
+  source than the pane screen; it feeds `parseLimitReset` unchanged.
+- `{"proto":1,"op":"subscribe","short":S,"tail":N}` — unauthenticated, read-only;
+  first `type:"snapshot"` frame carries `{record, streamTail:[lines]}` (the screen).
+- `{"proto":1,"op":"reply","short":S,"text":T,"auth":K}` → `{ok, error, code}` —
+  authenticated with `~/.claude/daemon/control.key` (32 bytes, trimmed). Submits T
+  AS A TURN to the live worker — the same path the `claude` CLI uses to message a
+  background session. Codes: `ESTARTING`/`ENOREPLY` transient (retry ~200ms, ≤12x),
+  `EAUTH` daemon rotated the key (re-read once), `ENOJOB` worker gone.
+
+Semantics that matter to the wait loop: `state:"working"` means a turn is in flight
+(`tempo:"active"` alone does NOT — it only means recent output); leaving `blocked`
+after a `reply` is the delivery verification. The dispatch op (spawning sessions) is
+also authenticated; resuming exited sessions hits the CLI's resume dialog (default
+option compacts!) and is deliberately out of scope — a rate-limited session is
+live-but-blocked.
+
+Stability: undocumented and version-coupled to Claude Code. The transport lives in
+`src/bg-sessions.js` behind small functions precisely so a first-party verb
+(`claude agents send`, if it ever ships) can replace it without touching detection
+or wait logic. Related reading: Origin Technology's analysis of these sockets as a
+security boundary (any local process can drive your background agents).

@@ -114,6 +114,12 @@ export const DEFAULT_NEAR_LIMIT_WRAP_UP = {
   retryMessage: 'continue',
 };
 
+// Background-session duty (see bg-watch.js): ONE monitor in the fleet is elected
+// leader by a lock file and drives daemon-hosted sessions. tickSeconds bounds how
+// often the leader polls the daemon roster; 30s is generous — detection is
+// structured state, not a screen to scrape.
+const DEFAULT_BG_WATCH = { enabled: true, tickSeconds: 30 };
+
 export const DEFAULT_CONFIG = {
   maxRetries: 5,
   pollIntervalSeconds: 5,
@@ -126,6 +132,7 @@ export const DEFAULT_CONFIG = {
   safeguard: DEFAULT_SAFEGUARD,
   streamInterrupted: DEFAULT_STREAM_INTERRUPTED,
   nearLimitWrapUp: DEFAULT_NEAR_LIMIT_WRAP_UP,
+  bgWatch: DEFAULT_BG_WATCH,
 };
 
 const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
@@ -243,6 +250,13 @@ function compiles(pattern) {
   try { new RegExp(pattern); return true; } catch { return false; }
 }
 
+function validateBgWatch(raw) {
+  const b = { ...DEFAULT_BG_WATCH, ...(raw && typeof raw === 'object' ? raw : {}) };
+  b.enabled = typeof b.enabled === 'boolean' ? b.enabled : DEFAULT_BG_WATCH.enabled;
+  b.tickSeconds = validNumber(b.tickSeconds, 15, DEFAULT_BG_WATCH.tickSeconds);
+  return b;
+}
+
 function validate(cfg) {
   cfg.maxRetries = validNumber(cfg.maxRetries, 1, DEFAULT_CONFIG.maxRetries);
   cfg.pollIntervalSeconds = validNumber(cfg.pollIntervalSeconds, 1, DEFAULT_CONFIG.pollIntervalSeconds);
@@ -265,6 +279,7 @@ function validate(cfg) {
     }
   }
   cfg.limitPatterns = validateLimitPatterns(cfg.limitPatterns);
+  cfg.bgWatch = validateBgWatch(cfg.bgWatch);
   cfg.overload = validateOverload(cfg.overload);
   cfg.safeguard = validateBoundedRetry(cfg.safeguard, DEFAULT_SAFEGUARD);
   cfg.streamInterrupted = validateBoundedRetry(cfg.streamInterrupted, DEFAULT_STREAM_INTERRUPTED);

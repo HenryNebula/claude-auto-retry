@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Background sessions (`claude agents` / `claude --bg`) are now covered — `claude-auto-retry bg`.**
+  The tmux monitors can only see a conversation while it is the one rendered in a
+  watched pane; Claude Code's daemon-hosted background sessions never render into a
+  pane at all, so a rate-limited one sat blocked until opened by hand (observed live:
+  a session parked 6h+ past its reset because nothing could even see it). This adds a
+  client for the daemon's control socket (newline-framed JSON over
+  `/tmp/cc-daemon-<uid>/<instance>/control.sock`), ported from the Go reference
+  implementation [kvaps/claude-agents-mcp](https://github.com/kvaps/claude-agents-mcp)
+  (Apache-2.0): `op:list` returns structured live state, a blocked job's `needs`
+  field carries the whole limit banner verbatim — full reset datetime, unwrapped,
+  better than the screen — and `op:reply` (authenticated with
+  `~/.claude/daemon/control.key`, with ESTARTING/ENOREPLY retry and one EAUTH key
+  refresh) submits the retry message as a TURN, no keystroke emulation, no
+  foreground gates. `bg list` shows the fleet; `bg send <ref> <msg>` delivers a
+  message; `bg watch` runs the usage-wait pipeline against the roster — detection
+  from `needs`, the existing parseLimitReset/calibration/limitHours-cap machinery
+  unchanged, the send at reset, verified by the next roster poll (a job that left
+  `blocked` accepted its turn), bounded by maxRetries. No separate process to run:
+  **every monitor embeds the duty** — a lock file (~/.claude-auto-retry/bg-watch.lock,
+  dead-PID-and-stale-heartbeat stealable) elects exactly one monitor in the fleet as
+  leader, waits and retry budgets persist to status/bg-watch.json so they survive
+  monitor restarts and the code-drift self-restart swap, and `bg watch` goes through
+  the same lock so it never double-drives a session the monitors already cover.
+  Disable with `bgWatch.enabled: false`; cadence via `bgWatch.tickSeconds` (30s). Deliberately out of scope:
+  resuming exited sessions (the reference's resume-dialog machinery) — a
+  rate-limited session is live-but-blocked. The protocol is reverse-engineered and
+  version-coupled to Claude Code; the transport sits behind small functions so a
+  first-party CLI verb can replace it without touching the wait logic.
 - **Monitors pick up source changes without giving up their pane.** A monitor is forked
   once per `claude` launch and then runs for days, executing the code that was on disk at
   its spawn — so fixes never reached already-running sessions. Observed live on
