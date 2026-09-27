@@ -8,7 +8,8 @@
     "claude-auto-retry-tmux-status": "bin/tmux-status.sh"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:e2e": "e2e/run.sh"
   },
   "license": "MIT",
   "engines": {
